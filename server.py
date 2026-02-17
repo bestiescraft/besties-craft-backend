@@ -26,12 +26,19 @@ app = FastAPI(title="E-Commerce Backend")
 # ===== CONFIG =====
 JWT_SECRET = os.getenv("JWT_SECRET")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
-
 MONGO_URI = os.getenv("MONGO_URI")
-DATABASE_NAME = os.getenv("DATABASE_NAME")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "bestiescraft")
+
+# ===== ENV VALIDATION =====
+if not JWT_SECRET:
+    raise Exception("JWT_SECRET missing in environment")
+if not ADMIN_PASSWORD:
+    raise Exception("ADMIN_PASSWORD missing in environment")
+if not MONGO_URI:
+    raise Exception("MONGO_URI missing in environment")
 
 # ===== MONGO CONNECT =====
-client = AsyncIOMotorClient(MONGO_URL)
+client = AsyncIOMotorClient(MONGO_URI)
 db = client[DATABASE_NAME]
 products_collection = db["products"]
 
@@ -81,7 +88,7 @@ def root():
     return {"message": "API Running Successfully"}
 
 
-# ===== ✅ HEALTH CHECK (NEW - FOR HOSTING) =====
+# ===== HEALTH CHECK =====
 @app.get("/health")
 async def health():
     return {"status": "ok"}
