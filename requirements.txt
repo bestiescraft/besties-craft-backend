@@ -4,4 +4,5 @@ python-dotenv
 motor
 python-jose[cryptography]
 pydantic
-bson
+pymongo
+
