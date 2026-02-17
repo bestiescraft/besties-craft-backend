@@ -1,5 +1,6 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 from pydantic import BaseModel
@@ -22,6 +23,20 @@ print("=" * 50)
 
 # ===== FASTAPI APP =====
 app = FastAPI(title="E-Commerce Backend")
+
+# ===== CORS CONFIGURATION =====
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "https://besties-craft-backend-1.onrender.com",
+        "*"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ===== CONFIG =====
 JWT_SECRET = os.getenv("JWT_SECRET")
