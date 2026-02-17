@@ -27,7 +27,7 @@ app = FastAPI(title="E-Commerce Backend")
 JWT_SECRET = os.getenv("JWT_SECRET")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
-MONGO_URL = os.getenv("MONGO_URL")
+MONGO_URI = os.getenv("MONGO_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME")
 
 # ===== MONGO CONNECT =====
