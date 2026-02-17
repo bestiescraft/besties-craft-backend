@@ -142,6 +142,25 @@ async def get_products():
     return products
 
 
+# ===== GET PRODUCT BY ID =====
+@api_router.get("/products/{product_id}", response_model=Product)
+async def get_product(product_id: str):
+    try:
+        product = await products_collection.find_one({"_id": ObjectId(product_id)})
+        
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        
+        product["id"] = str(product["_id"])
+        del product["_id"]
+        return product
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid product ID")
+
+
 # ===== CREATE PRODUCT =====
 @api_router.post(
     "/products",
@@ -164,15 +183,20 @@ async def create_product(product: ProductCreate):
 )
 async def update_product(product_id: str, product: ProductCreate):
 
-    update_result = await products_collection.update_one(
-        {"_id": ObjectId(product_id)},
-        {"$set": product.model_dump()}
-    )
+    try:
+        update_result = await products_collection.update_one(
+            {"_id": ObjectId(product_id)},
+            {"$set": product.model_dump()}
+        )
 
-    if update_result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Product not found")
+        if update_result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Product not found")
 
-    return {"message": "Product updated"}
+        return {"message": "Product updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid product ID")
 
 
 # ===== DELETE PRODUCT =====
@@ -182,14 +206,19 @@ async def update_product(product_id: str, product: ProductCreate):
 )
 async def delete_product(product_id: str):
 
-    delete_result = await products_collection.delete_one(
-        {"_id": ObjectId(product_id)}
-    )
+    try:
+        delete_result = await products_collection.delete_one(
+            {"_id": ObjectId(product_id)}
+        )
 
-    if delete_result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Product not found")
+        if delete_result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Product not found")
 
-    return {"message": "Product deleted"}
+        return {"message": "Product deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid product ID")
 
 
 # ===== INCLUDE ROUTER =====
