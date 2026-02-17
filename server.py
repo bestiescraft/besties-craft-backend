@@ -13,6 +13,13 @@ from bson import ObjectId
 # ===== LOAD ENV =====
 load_dotenv()
 
+print("=" * 50)
+print("STARTUP DEBUG INFO:")
+print(f"MONGO_URI exists: {bool(os.getenv('MONGO_URI'))}")
+print(f"JWT_SECRET exists: {bool(os.getenv('JWT_SECRET'))}")
+print(f"DATABASE_NAME: {os.getenv('DATABASE_NAME', 'bestiescraft')}")
+print("=" * 50)
+
 # ===== FASTAPI APP =====
 app = FastAPI(title="E-Commerce Backend")
 
