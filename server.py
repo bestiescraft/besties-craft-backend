@@ -1,225 +1,167 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Security
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta, timezone
-from jose import jwt, JWTError
 from pydantic import BaseModel
-from typing import Optional, List
+from pymongo import MongoClient
+from bson import ObjectId
+from datetime import datetime
 import os
 
-from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId
+# MongoDB Connection
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+client = MongoClient(MONGO_URI)
+db = client["besties"]
 
-# ===== LOAD ENV =====
-load_dotenv()
+# Product Schema
+class Product(BaseModel):
+    name: str
+    description: str
+    price: float
+    image: str
+    stock: int = 10
+    category: str = "general"
 
-print("=" * 50)
-print("STARTUP DEBUG INFO:")
-print(f"MONGO_URI exists: {bool(os.getenv('MONGO_URI'))}")
-print(f"JWT_SECRET exists: {bool(os.getenv('JWT_SECRET'))}")
-print(f"DATABASE_NAME: {os.getenv('DATABASE_NAME', 'bestiescraft')}")
-print("=" * 50)
+app = FastAPI()
 
-# ===== FASTAPI APP =====
-app = FastAPI(title="E-Commerce Backend")
-
-# ===== CORS CONFIGURATION =====
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "https://besties-craft-backend-1.onrender.com",
-        "*"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== CONFIG =====
-JWT_SECRET = os.getenv("JWT_SECRET")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
-MONGO_URI = os.getenv("MONGO_URI")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "bestiescraft")
-
-# ===== ENV VALIDATION =====
-if not JWT_SECRET:
-    raise Exception("JWT_SECRET missing in environment")
-if not ADMIN_PASSWORD:
-    raise Exception("ADMIN_PASSWORD missing in environment")
-if not MONGO_URI:
-    raise Exception("MONGO_URI missing in environment")
-
-# ===== MONGO CONNECT =====
-client = AsyncIOMotorClient(MONGO_URI)
-db = client[DATABASE_NAME]
-products_collection = db["products"]
-
-# ===== ROUTER =====
-api_router = APIRouter()
-
-# ===== SECURITY =====
-security = HTTPBearer()
-
-# ===== MODELS =====
-class AdminLogin(BaseModel):
-    password: str
-
-
-class ProductCreate(BaseModel):
-    name: str
-    price: float
-    description: Optional[str] = None
-    image_url: Optional[str] = None
-
-
-class Product(ProductCreate):
-    id: str
-
-
-# ===== TOKEN VERIFY =====
-def verify_admin_token(
-    credentials: HTTPAuthorizationCredentials = Security(security)
-):
-    token = credentials.credentials
-
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-
-        if not payload.get("is_admin"):
-            raise HTTPException(status_code=403, detail="Admin only")
-
-        return payload
-
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-# ===== ROOT =====
-@app.get("/")
-def root():
-    return {"message": "API Running Successfully"}
-
-
-# ===== HEALTH CHECK =====
+# Health Check
 @app.get("/health")
-async def health():
+def health_check():
     return {"status": "ok"}
 
-
-# ===== ADMIN LOGIN =====
-@api_router.post("/auth/admin-login")
-async def admin_login(request: AdminLogin):
-
-    if request.password != ADMIN_PASSWORD:
-        raise HTTPException(status_code=401, detail="Invalid password")
-
-    token = jwt.encode(
-        {
-            "user_id": "admin",
-            "is_admin": True,
-            "exp": datetime.now(timezone.utc) + timedelta(days=1),
-        },
-        JWT_SECRET,
-        algorithm="HS256",
-    )
-
-    return {"token": token}
-
-
-# ===== GET ALL PRODUCTS =====
-@api_router.get("/products", response_model=List[Product])
-async def get_products():
-
-    products = []
-    async for product in products_collection.find():
-        product["id"] = str(product["_id"])
-        del product["_id"]
-        products.append(product)
-
-    return products
-
-
-# ===== GET PRODUCT BY ID =====
-@api_router.get("/products/{product_id}", response_model=Product)
-async def get_product(product_id: str):
+# GET all products
+@app.get("/products")
+def get_products():
     try:
-        product = await products_collection.find_one({"_id": ObjectId(product_id)})
+        products = list(db.products.find())
+        for product in products:
+            product["_id"] = str(product["_id"])
+        return products
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# GET single product by ID
+@app.get("/products/{product_id}")
+def get_product(product_id: str):
+    try:
+        product_id = ObjectId(product_id)
+        product = db.products.find_one({"_id": product_id})
         
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
         
-        product["id"] = str(product["_id"])
-        del product["_id"]
+        product["_id"] = str(product["_id"])
         return product
-    
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid product ID")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# ===== CREATE PRODUCT =====
-@api_router.post(
-    "/products",
-    dependencies=[Depends(verify_admin_token)],
-    response_model=Product
-)
-async def create_product(product: ProductCreate):
-
-    product_dict = product.model_dump()
-    result = await products_collection.insert_one(product_dict)
-
-    product_dict["id"] = str(result.inserted_id)
-    return product_dict
-
-
-# ===== UPDATE PRODUCT =====
-@api_router.put(
-    "/products/{product_id}",
-    dependencies=[Depends(verify_admin_token)]
-)
-async def update_product(product_id: str, product: ProductCreate):
-
+# CREATE product (Admin only)
+@app.post("/products")
+def create_product(product: Product, admin_token: str = Header(None)):
     try:
-        update_result = await products_collection.update_one(
-            {"_id": ObjectId(product_id)},
-            {"$set": product.model_dump()}
-        )
-
-        if update_result.matched_count == 0:
-            raise HTTPException(status_code=404, detail="Product not found")
-
-        return {"message": "Product updated"}
-    except HTTPException:
-        raise
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        product_dict = product.dict()
+        product_dict["createdAt"] = datetime.utcnow()
+        product_dict["updatedAt"] = datetime.utcnow()
+        product_dict["stock"] = max(product_dict.get("stock", 10), 0)
+        product_dict["inStock"] = product_dict["stock"] > 0
+        
+        result = db.products.insert_one(product_dict)
+        product_dict["_id"] = str(result.inserted_id)
+        
+        return {"message": "Product created", "product": product_dict}
     except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid product ID")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# ===== DELETE PRODUCT =====
-@api_router.delete(
-    "/products/{product_id}",
-    dependencies=[Depends(verify_admin_token)]
-)
-async def delete_product(product_id: str):
-
+# UPDATE product (Admin only)
+@app.put("/products/{product_id}")
+def update_product(product_id: str, product: Product, admin_token: str = Header(None)):
     try:
-        delete_result = await products_collection.delete_one(
-            {"_id": ObjectId(product_id)}
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        product_id = ObjectId(product_id)
+        product_dict = product.dict()
+        product_dict["updatedAt"] = datetime.utcnow()
+        product_dict["stock"] = max(product_dict.get("stock", 10), 0)
+        product_dict["inStock"] = product_dict["stock"] > 0
+        
+        result = db.products.update_one(
+            {"_id": product_id},
+            {"$set": product_dict}
         )
-
-        if delete_result.deleted_count == 0:
+        
+        if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
+        
+        return {"message": "Product updated", "modified_count": result.modified_count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+# DELETE product (Admin only)
+@app.delete("/products/{product_id}")
+def delete_product(product_id: str, admin_token: str = Header(None)):
+    try:
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        product_id = ObjectId(product_id)
+        result = db.products.delete_one({"_id": product_id})
+        
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Product not found")
+        
         return {"message": "Product deleted"}
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid product ID")
+        raise HTTPException(status_code=500, detail=str(e))
 
+# FIX STOCK - Temporary endpoint to add stock to existing products
+@app.put("/products/{product_id}/add-stock")
+def add_stock_field(product_id: str):
+    try:
+        product_id = ObjectId(product_id)
+        
+        result = db.products.update_one(
+            {"_id": product_id},
+            {
+                "$set": {
+                    "stock": 10,
+                    "inStock": True,
+                    "updatedAt": datetime.utcnow()
+                }
+            }
+        )
+        
+        if result.matched_count == 0:
+            return {"error": "Product not found"}, 404
+        
+        return {"message": "Stock fields added", "modified_count": result.modified_count}
+    except Exception as e:
+        return {"error": str(e)}, 500
 
-# ===== INCLUDE ROUTER =====
-app.include_router(api_router)
+# Admin Login
+@app.post("/auth/admin-login")
+def admin_login(credentials: dict):
+    try:
+        username = credentials.get("username")
+        password = credentials.get("password")
+        
+        if username == "admin" and password == os.getenv("ADMIN_PASSWORD", "admin123"):
+            return {
+                "success": True,
+                "message": "Login successful",
+                "token": os.getenv("ADMIN_TOKEN", "your-secret-token")
+            }
+        else:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
