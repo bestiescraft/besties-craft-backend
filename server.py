@@ -7,9 +7,7 @@ from datetime import datetime
 import os
 import random
 import string
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import requests
 import hashlib
 
 # MongoDB Connection
@@ -47,25 +45,40 @@ app.add_middleware(
 def generate_otp():
     return ''.join(random.choices(string.digits, k=6))
 
-# Helper function to send email
+# Helper function to send email with Brevo
 def send_email(recipient_email, subject, body):
     try:
-        sender_email = os.getenv("SENDER_EMAIL", "your-email@gmail.com")
-        sender_password = os.getenv("SENDER_PASSWORD", "your-app-password")
+        api_key = os.getenv("BREVO_API_KEY")
         
-        message = MIMEMultipart()
-        message["From"] = sender_email
-        message["To"] = recipient_email
-        message["Subject"] = subject
+        if not api_key:
+            print("❌ BREVO_API_KEY not found in environment variables")
+            return False
         
-        message.attach(MIMEText(body, "html"))
+        message = {
+            "sender": {"name": "Besties Craft", "email": "akkuyadav1434@gmail.com"},
+            "to": [{"email": recipient_email}],
+            "subject": subject,
+            "htmlContent": body
+        }
         
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender_email, sender_password)
-            server.send_message(message)
+        headers = {
+            "api-key": api_key,
+            "Content-Type": "application/json"
+        }
         
-        print(f"✅ Email sent to {recipient_email}")
-        return True
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=message,
+            headers=headers
+        )
+        
+        if response.status_code == 201:
+            print(f"✅ Email sent successfully to {recipient_email}")
+            return True
+        else:
+            print(f"❌ Email error: {response.status_code} - {response.text}")
+            return False
+            
     except Exception as e:
         print(f"❌ Email error: {str(e)}")
         return False
@@ -215,11 +228,14 @@ def send_otp(data: dict):
         if login_method == "email":
             email_body = f"""
             <html>
-                <body style="font-family: Arial, sans-serif;">
-                    <h2>Besties Craft - Login Verification</h2>
-                    <p>Your OTP is: <strong style="font-size: 24px; color: #D97706;">{otp}</strong></p>
-                    <p>This OTP will expire in 10 minutes.</p>
-                    <p>If you didn't request this, please ignore this email.</p>
+                <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 20px;">
+                    <div style="background-color: white; padding: 30px; border-radius: 8px; max-width: 500px; margin: 0 auto;">
+                        <h2 style="color: #333;">Besties Craft - Login Verification</h2>
+                        <p style="color: #666; font-size: 14px;">Your OTP is:</p>
+                        <h1 style="font-size: 36px; color: #FF6B35; letter-spacing: 8px; text-align: center; margin: 30px 0;">{otp}</h1>
+                        <p style="color: #999; font-size: 12px;">This OTP will expire in 10 minutes.</p>
+                        <p style="color: #999; font-size: 12px;">If you didn't request this, please ignore this email.</p>
+                    </div>
                 </body>
             </html>
             """
