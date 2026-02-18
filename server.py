@@ -124,53 +124,6 @@ def delete_product(product_id: str, admin_token: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# FIX STOCK - Add stock to single product
-@app.put("/products/{product_id}/add-stock")
-def add_stock_field(product_id: str):
-    try:
-        product_id = ObjectId(product_id)
-        
-        result = db.products.update_one(
-            {"_id": product_id},
-            {
-                "$set": {
-                    "stock": 10,
-                    "inStock": True,
-                    "updatedAt": datetime.utcnow()
-                }
-            }
-        )
-        
-        if result.matched_count == 0:
-            return {"error": "Product not found"}, 404
-        
-        return {"message": "Stock fields added", "modified_count": result.modified_count}
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-# BULK UPDATE ALL PRODUCTS - Add stock and inStock fields (OPTION 3)
-@app.post("/products/bulk/add-stock")
-def bulk_add_stock():
-    try:
-        result = db.products.update_many(
-            {},  # This means ALL products
-            {
-                "$set": {
-                    "stock": 10,
-                    "inStock": True,
-                    "updatedAt": datetime.utcnow()
-                }
-            }
-        )
-        
-        return {
-            "message": "All products updated successfully",
-            "modified_count": result.modified_count,
-            "success": True
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 # Admin Login
 @app.post("/auth/admin-login")
 def admin_login(credentials: dict):
