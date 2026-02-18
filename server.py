@@ -9,7 +9,7 @@ import os
 # MongoDB Connection
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 client = MongoClient(MONGO_URI)
-db = client["besties"]
+db = client["besties_craft_db"]
 
 # Product Schema
 class Product(BaseModel):
@@ -124,7 +124,7 @@ def delete_product(product_id: str, admin_token: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# FIX STOCK - Temporary endpoint to add stock to existing products
+# FIX STOCK - Add stock to single product
 @app.put("/products/{product_id}/add-stock")
 def add_stock_field(product_id: str):
     try:
@@ -147,6 +147,29 @@ def add_stock_field(product_id: str):
         return {"message": "Stock fields added", "modified_count": result.modified_count}
     except Exception as e:
         return {"error": str(e)}, 500
+
+# BULK UPDATE ALL PRODUCTS - Add stock and inStock fields (OPTION 3)
+@app.put("/products/bulk/add-stock")
+def bulk_add_stock():
+    try:
+        result = db.products.update_many(
+            {},  # This means ALL products
+            {
+                "$set": {
+                    "stock": 10,
+                    "inStock": True,
+                    "updatedAt": datetime.utcnow()
+                }
+            }
+        )
+        
+        return {
+            "message": "All products updated successfully",
+            "modified_count": result.modified_count,
+            "success": True
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Admin Login
 @app.post("/auth/admin-login")
