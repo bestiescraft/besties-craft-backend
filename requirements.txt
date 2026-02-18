@@ -6,3 +6,4 @@ python-jose[cryptography]
 pydantic
 pymongo
 requests
+twilio
