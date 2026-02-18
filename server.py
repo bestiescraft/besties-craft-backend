@@ -127,7 +127,7 @@ def root():
 
 # ============= PRODUCTS ENDPOINTS =============
 
-# GET all products
+# GET all products - WITH /api prefix
 @app.get("/api/products")
 def get_products():
     try:
@@ -138,7 +138,7 @@ def get_products():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# GET all products (FALLBACK without /api)
+# GET all products - WITHOUT /api prefix (fallback)
 @app.get("/products")
 def get_products_fallback():
     try:
@@ -149,7 +149,7 @@ def get_products_fallback():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# GET single product by ID
+# GET single product by ID - WITH /api prefix
 @app.get("/api/products/{product_id}")
 def get_product(product_id: str):
     try:
@@ -164,7 +164,7 @@ def get_product(product_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# GET single product by ID (FALLBACK without /api)
+# GET single product by ID - WITHOUT /api prefix (fallback)
 @app.get("/products/{product_id}")
 def get_product_fallback(product_id: str):
     try:
