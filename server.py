@@ -83,9 +83,11 @@ def send_email(recipient_email, subject, body):
         print(f"❌ Email error: {str(e)}")
         return False
 
+
 # Helper function to send SMS with Twilio
 def send_sms(phone_number, otp):
     try:
+        import os
         from twilio.rest import Client
         
         account_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -95,6 +97,13 @@ def send_sms(phone_number, otp):
         if not all([account_sid, auth_token, twilio_phone]):
             print("❌ Twilio credentials not found in environment variables")
             return False
+        
+        # ✅ FORMAT PHONE NUMBER (IMPORTANT FIX)
+        phone_number = str(phone_number).strip()
+        
+        if not phone_number.startswith("+"):
+            # Default India country code
+            phone_number = "+91" + phone_number
         
         client = Client(account_sid, auth_token)
         
@@ -110,6 +119,7 @@ def send_sms(phone_number, otp):
     except Exception as e:
         print(f"❌ SMS error: {str(e)}")
         return False
+
 
 # Health Check
 @app.get("/health")
