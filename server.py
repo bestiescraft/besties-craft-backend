@@ -83,6 +83,34 @@ def send_email(recipient_email, subject, body):
         print(f"❌ Email error: {str(e)}")
         return False
 
+# Helper function to send SMS with Twilio
+def send_sms(phone_number, otp):
+    try:
+        from twilio.rest import Client
+        
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        twilio_phone = os.getenv("TWILIO_PHONE_NUMBER")
+        
+        if not all([account_sid, auth_token, twilio_phone]):
+            print("❌ Twilio credentials not found in environment variables")
+            return False
+        
+        client = Client(account_sid, auth_token)
+        
+        message = client.messages.create(
+            body=f"Your Besties Craft OTP is: {otp}. This expires in 10 minutes.",
+            from_=twilio_phone,
+            to=phone_number
+        )
+        
+        print(f"✅ SMS sent successfully to {phone_number}: {message.sid}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ SMS error: {str(e)}")
+        return False
+
 # Health Check
 @app.get("/health")
 def health_check():
@@ -244,10 +272,12 @@ def send_otp(data: dict):
             if not email_sent:
                 raise HTTPException(status_code=500, detail="Failed to send email")
         
-        # For phone, you would integrate with Twilio or similar
+        # Send OTP via SMS
         elif login_method == "phone":
-            # For now, return success (in production, use Twilio)
-            print(f"📱 SMS OTP would be sent to: {phone}")
+            sms_sent = send_sms(phone, otp)
+            
+            if not sms_sent:
+                raise HTTPException(status_code=500, detail="Failed to send SMS")
         
         return {
             "success": True,
