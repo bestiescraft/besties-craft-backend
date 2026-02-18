@@ -149,7 +149,7 @@ def add_stock_field(product_id: str):
         return {"error": str(e)}, 500
 
 # BULK UPDATE ALL PRODUCTS - Add stock and inStock fields (OPTION 3)
-@app.put("/products/bulk/add-stock")
+@app.post("/products/bulk/add-stock")
 def bulk_add_stock():
     try:
         result = db.products.update_many(
