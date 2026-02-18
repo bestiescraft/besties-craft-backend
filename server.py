@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -9,6 +9,11 @@ import random
 import string
 import requests
 import hashlib
+import logging
+
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("besties-craft")
 
 # MongoDB Connection
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -20,6 +25,7 @@ try:
     print("✅ MongoDB connected successfully")
 except Exception as e:
     print(f"❌ MongoDB connection failed: {e}")
+    logger.error(f"MongoDB connection failed: {e}")
 
 # Product Schema
 class Product(BaseModel):
@@ -51,7 +57,7 @@ def send_email(recipient_email, subject, body):
         api_key = os.getenv("BREVO_API_KEY")
         
         if not api_key:
-            print("❌ BREVO_API_KEY not found in environment variables")
+            logger.warning("BREVO_API_KEY not found in environment variables")
             return False
         
         message = {
@@ -73,14 +79,14 @@ def send_email(recipient_email, subject, body):
         )
         
         if response.status_code == 201:
-            print(f"✅ Email sent successfully to {recipient_email}")
+            logger.info(f"Email sent successfully to {recipient_email}")
             return True
         else:
-            print(f"❌ Email error: {response.status_code} - {response.text}")
+            logger.error(f"Email error: {response.status_code} - {response.text}")
             return False
             
     except Exception as e:
-        print(f"❌ Email error: {str(e)}")
+        logger.error(f"Email error: {str(e)}")
         return False
 
 # Helper function to send SMS with Twilio
@@ -93,7 +99,7 @@ def send_sms(phone_number, otp):
         twilio_phone = os.getenv("TWILIO_PHONE_NUMBER")
         
         if not all([account_sid, auth_token, twilio_phone]):
-            print("❌ Twilio credentials not found in environment variables")
+            logger.warning("Twilio credentials not found in environment variables")
             return False
         
         client = Client(account_sid, auth_token)
@@ -104,21 +110,23 @@ def send_sms(phone_number, otp):
             to=phone_number
         )
         
-        print(f"✅ SMS sent successfully to {phone_number}: {message.sid}")
+        logger.info(f"SMS sent successfully to {phone_number}: {message.sid}")
         return True
         
     except Exception as e:
-        print(f"❌ SMS error: {str(e)}")
+        logger.error(f"SMS error: {str(e)}")
         return False
 
 # Health Check
 @app.get("/health")
 def health_check():
+    logger.info("Health check called")
     return {"status": "ok"}
 
 # Root endpoint
 @app.get("/")
 def root():
+    logger.info("Root endpoint called")
     return {
         "message": "Besties Craft Backend API",
         "docs": "/docs",
@@ -131,35 +139,56 @@ def root():
 @app.get("/api/products")
 def get_products():
     try:
+        logger.info("Fetching all products")
         products = list(db.products.find())
         for product in products:
             product["_id"] = str(product["_id"])
+        logger.info(f"Returned {len(products)} products")
         return products
     except Exception as e:
+        logger.error(f"Error fetching products: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# GET all products (FALLBACK without /api)
+@app.get("/products")
+def get_products_fallback():
+    """Fallback route for requests without /api prefix"""
+    return get_products()
 
 # GET single product by ID
 @app.get("/api/products/{product_id}")
 def get_product(product_id: str):
     try:
+        logger.info(f"Fetching product with ID: {product_id}")
         product_id = ObjectId(product_id)
         product = db.products.find_one({"_id": product_id})
         
         if not product:
+            logger.warning(f"Product not found: {product_id}")
             raise HTTPException(status_code=404, detail="Product not found")
         
         product["_id"] = str(product["_id"])
+        logger.info(f"Product fetched successfully: {product_id}")
         return product
     except Exception as e:
+        logger.error(f"Error fetching product: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# GET single product by ID (FALLBACK without /api)
+@app.get("/products/{product_id}")
+def get_product_fallback(product_id: str):
+    """Fallback route for requests without /api prefix"""
+    return get_product(product_id)
 
 # CREATE product (Admin only)
 @app.post("/api/products")
 def create_product(product: Product, admin_token: str = Header(None)):
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            logger.warning("Unauthorized product creation attempt")
             raise HTTPException(status_code=401, detail="Unauthorized")
         
+        logger.info(f"Creating new product: {product.name}")
         product_dict = product.dict()
         product_dict["createdAt"] = datetime.utcnow()
         product_dict["updatedAt"] = datetime.utcnow()
@@ -169,8 +198,10 @@ def create_product(product: Product, admin_token: str = Header(None)):
         result = db.products.insert_one(product_dict)
         product_dict["_id"] = str(result.inserted_id)
         
+        logger.info(f"Product created successfully: {result.inserted_id}")
         return {"message": "Product created", "product": product_dict}
     except Exception as e:
+        logger.error(f"Error creating product: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # UPDATE product (Admin only)
@@ -178,8 +209,10 @@ def create_product(product: Product, admin_token: str = Header(None)):
 def update_product(product_id: str, product: Product, admin_token: str = Header(None)):
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            logger.warning("Unauthorized product update attempt")
             raise HTTPException(status_code=401, detail="Unauthorized")
         
+        logger.info(f"Updating product: {product_id}")
         product_id = ObjectId(product_id)
         product_dict = product.dict()
         product_dict["updatedAt"] = datetime.utcnow()
@@ -192,10 +225,13 @@ def update_product(product_id: str, product: Product, admin_token: str = Header(
         )
         
         if result.matched_count == 0:
+            logger.warning(f"Product not found for update: {product_id}")
             raise HTTPException(status_code=404, detail="Product not found")
         
+        logger.info(f"Product updated successfully: {product_id}")
         return {"message": "Product updated", "modified_count": result.modified_count}
     except Exception as e:
+        logger.error(f"Error updating product: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # DELETE product (Admin only)
@@ -203,16 +239,21 @@ def update_product(product_id: str, product: Product, admin_token: str = Header(
 def delete_product(product_id: str, admin_token: str = Header(None)):
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            logger.warning("Unauthorized product deletion attempt")
             raise HTTPException(status_code=401, detail="Unauthorized")
         
+        logger.info(f"Deleting product: {product_id}")
         product_id = ObjectId(product_id)
         result = db.products.delete_one({"_id": product_id})
         
         if result.deleted_count == 0:
+            logger.warning(f"Product not found for deletion: {product_id}")
             raise HTTPException(status_code=404, detail="Product not found")
         
+        logger.info(f"Product deleted successfully: {product_id}")
         return {"message": "Product deleted"}
     except Exception as e:
+        logger.error(f"Error deleting product: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= AUTH ENDPOINTS =============
@@ -225,34 +266,28 @@ def send_otp(data: dict):
         phone = data.get("phone")
         
         if not email and not phone:
+            logger.warning("Send OTP: Missing email or phone")
             raise HTTPException(status_code=400, detail="Missing email or phone")
         
-        # Determine login method and identifier
         identifier = email if email else phone
         login_method = "email" if email else "phone"
         
-        print(f"📧 Sending OTP to {login_method}: {identifier}")
+        logger.info(f"Sending OTP to {login_method}: {identifier}")
         
-        # Generate OTP
         otp = generate_otp()
         
-        # Store OTP in MongoDB
         otp_record = {
             "identifier": identifier,
             "login_method": login_method,
             "otp": otp,
             "createdAt": datetime.utcnow(),
-            "expiresAt": datetime.utcnow().timestamp() + 600  # 10 minutes
+            "expiresAt": datetime.utcnow().timestamp() + 600
         }
         
-        # Delete any old OTP for this identifier
         db.otps.delete_many({"identifier": identifier})
-        
-        # Insert new OTP
         db.otps.insert_one(otp_record)
-        print(f"✅ OTP stored in database: {otp}")
+        logger.info(f"OTP stored in database for {identifier}")
         
-        # Send OTP via email
         if login_method == "email":
             email_body = f"""
             <html>
@@ -270,13 +305,14 @@ def send_otp(data: dict):
             email_sent = send_email(email, "Besties Craft - Your OTP", email_body)
             
             if not email_sent:
+                logger.error("Failed to send email OTP")
                 raise HTTPException(status_code=500, detail="Failed to send email")
         
-        # Send OTP via SMS
         elif login_method == "phone":
             sms_sent = send_sms(phone, otp)
             
             if not sms_sent:
+                logger.error("Failed to send SMS OTP")
                 raise HTTPException(status_code=500, detail="Failed to send SMS")
         
         return {
@@ -288,7 +324,7 @@ def send_otp(data: dict):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Send OTP Error: {str(e)}")
+        logger.error(f"Send OTP Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # VERIFY OTP
@@ -303,32 +339,30 @@ def verify_otp(data: dict):
         login_method = "email" if email else "phone"
         
         if not identifier or not otp_entered:
+            logger.warning("Verify OTP: Missing email/phone or OTP")
             raise HTTPException(status_code=400, detail="Missing email/phone or OTP")
         
-        print(f"🔍 Verifying OTP for {login_method}: {identifier}")
+        logger.info(f"Verifying OTP for {login_method}: {identifier}")
         
-        # Find OTP in database
         otp_record = db.otps.find_one({"identifier": identifier})
         
         if not otp_record:
+            logger.warning(f"OTP not found for {identifier}")
             raise HTTPException(status_code=401, detail="OTP not found or expired")
         
-        # Check expiry
         if datetime.utcnow().timestamp() > otp_record.get("expiresAt", 0):
             db.otps.delete_one({"_id": otp_record["_id"]})
+            logger.warning(f"OTP expired for {identifier}")
             raise HTTPException(status_code=401, detail="OTP has expired")
         
-        # Verify OTP
         if str(otp_record["otp"]) != otp_entered:
-            print(f"❌ Invalid OTP. Expected: {otp_record['otp']}, Got: {otp_entered}")
+            logger.warning(f"Invalid OTP for {identifier}")
             raise HTTPException(status_code=401, detail="Invalid OTP")
         
-        print(f"✅ OTP verified successfully!")
+        logger.info(f"OTP verified successfully for {identifier}")
         
-        # Delete used OTP
         db.otps.delete_one({"_id": otp_record["_id"]})
         
-        # Create or update user in database
         user_data = {
             login_method: identifier,
             "lastLogin": datetime.utcnow()
@@ -340,117 +374,4 @@ def verify_otp(data: dict):
             upsert=True
         )
         
-        # Get user data
-        user = db.users.find_one({login_method: identifier})
-        user_id = str(user["_id"]) if user else None
-        
-        # Generate simple token using hashlib (no JWT needed)
-        token = hashlib.sha256(f"{user_id}{identifier}{datetime.utcnow()}".encode()).hexdigest()
-        
-        return {
-            "success": True,
-            "message": "Login successful",
-            "token": token,
-            "user": {
-                "id": user_id,
-                "email": email if login_method == "email" else None,
-                "phone": phone if login_method == "phone" else None
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Verify OTP Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Admin Login
-@app.post("/api/auth/admin-login")
-def admin_login(credentials: dict):
-    try:
-        username = credentials.get("username")
-        password = credentials.get("password")
-        
-        admin_email = os.getenv("ADMIN_EMAIL", "admin@besties.com")
-        admin_password = os.getenv("ADMIN_PASSWORD", "Bhola143")
-        
-        if username == admin_email and password == admin_password:
-            # Generate simple token using hashlib
-            token = hashlib.sha256(f"{admin_email}{datetime.utcnow()}".encode()).hexdigest()
-            
-            return {
-                "success": True,
-                "message": "Login successful",
-                "token": token
-            }
-        else:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ============= ORDERS ENDPOINTS =============
-
-@app.post("/api/orders/create")
-def create_order(order_data: dict, authorization: str = Header(None)):
-    try:
-        # Verify token
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing or invalid token")
-        
-        token = authorization.split(" ")[1]
-        
-        # Simple token validation (just check if it's a valid hex string)
-        if not token or len(token) < 10:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
-        # Create order
-        order = {
-            "user_id": order_data.get("user_id"),
-            "items": order_data.get("items", []),
-            "total_amount": order_data.get("total_amount", 0),
-            "status": "pending",
-            "createdAt": datetime.utcnow()
-        }
-        
-        result = db.orders.insert_one(order)
-        order["_id"] = str(result.inserted_id)
-        
-        return {
-            "success": True,
-            "order": order,
-            "razorpay_order": {
-                "id": f"order_{result.inserted_id}",
-                "amount": int(order["total_amount"] * 100)  # Convert to paise
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/orders/verify-payment")
-def verify_payment(payment_data: dict):
-    try:
-        # In production, verify Razorpay signature
-        order_id = payment_data.get("order_id")
-        
-        # Update order status
-        db.orders.update_one(
-            {"_id": ObjectId(order_id)},
-            {"$set": {"status": "completed", "paidAt": datetime.utcnow()}}
-        )
-        
-        return {
-            "success": True,
-            "message": "Payment verified"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        user
