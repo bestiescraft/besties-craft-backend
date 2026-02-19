@@ -8,6 +8,7 @@ from bson import ObjectId
 from datetime import datetime
 import os
 from pathlib import Path
+import random
 
 # ============= SETUP =============
 
@@ -400,7 +401,7 @@ def send_otp(data: dict):
         
         identifier = email if email else phone
         
-        otp = ''.join([str(__import__('random').randint(0, 9)) for _ in range(6))])
+        otp = ''.join([str(__import__('random').randint(0, 9)) for _ in range(6)])
         
         otp_record = {
             "identifier": identifier,
