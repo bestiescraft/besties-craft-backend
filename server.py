@@ -60,6 +60,7 @@ class Product(BaseModel):
     base_price: float
     images: List[ProductImage]
     category: str = "general"
+    stock: int = 0
     variants: List[ProductVariant] = []
     skus: List[SKUOption] = []
     rating: float = 0
@@ -399,7 +400,7 @@ def send_otp(data: dict):
         
         identifier = email if email else phone
         
-        otp = ''.join([str(__import__('random').randint(0, 9)) for _ in range(6)])
+        otp = ''.join([str(__import__('random').randint(0, 9)) for _ in range(6))])
         
         otp_record = {
             "identifier": identifier,
