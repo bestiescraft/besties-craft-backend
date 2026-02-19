@@ -185,8 +185,9 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
         
         for product in products:
             product["_id"] = str(product["_id"])
+            # ✅ FIX 4: Keep stock in response, just also add in_stock for convenience
             product["in_stock"] = product.get("stock", 0) > 0
-            product.pop("stock", None)
+            # REMOVED: product.pop("stock", None)  ← this was deleting stock!
             if product.get("skus"):
                 for sku in product["skus"]:
                     sku.pop("stock", None)
@@ -208,8 +209,9 @@ def get_product(product_id: str):
             raise HTTPException(status_code=404, detail="Product not found")
         
         product["_id"] = str(product["_id"])
+        # ✅ FIX 4: Keep stock in response, just also add in_stock for convenience
         product["in_stock"] = product.get("stock", 0) > 0
-        product.pop("stock", None)
+        # REMOVED: product.pop("stock", None)  ← this was causing stock to show as 0!
         
         reviews = list(db.reviews.find({"product_id": product_id}).limit(10))
         for review in reviews:
