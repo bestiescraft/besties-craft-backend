@@ -11,3 +11,4 @@ slowapi
 python-multipart
 aiofiles
 Pillow
+cloudinary
