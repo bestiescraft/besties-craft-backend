@@ -50,7 +50,7 @@ def connect_to_mongo():
     """Establish MongoDB connection with proper error handling"""
     global client, db
     try:
-        logger.info(f"🔄 Connecting to MongoDB: {MONGO_URI.split('@')[0]}***")
+        logger.info(f"🔄 Connecting to MongoDB...")
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         
         # Verify connection
@@ -85,6 +85,270 @@ def connect_to_mongo():
     except Exception as e:
         logger.error(f"❌ Unexpected error connecting to MongoDB: {e}")
         return False
+
+def create_sample_products():
+    """Create sample products if database is empty"""
+    try:
+        if db is None:
+            logger.warning("⚠️  Database not connected, skipping sample data creation")
+            return
+        
+        product_count = db.products.count_documents({})
+        
+        if product_count > 0:
+            logger.info(f"✅ Database already has {product_count} products")
+            return
+        
+        logger.info("📝 Creating sample products...")
+        
+        sample_products = [
+            {
+                "name": "Cozy Woollen Blanket",
+                "description": "Warm and soft woollen blanket perfect for winters. Handcrafted with love using premium quality wool.",
+                "base_price": 1299.00,
+                "category": "Blankets",
+                "brand": "Besties Craft",
+                "images": [
+                    {
+                        "url": "/uploads/products/default-blanket.jpg",
+                        "alt_text": "Cozy Woollen Blanket",
+                        "is_primary": True
+                    }
+                ],
+                "variants": [
+                    {
+                        "name": "Color",
+                        "options": ["Beige", "Gray", "Navy Blue", "Cream"],
+                        "is_visible": True
+                    },
+                    {
+                        "name": "Size",
+                        "options": ["Single", "Double", "King"],
+                        "is_visible": True
+                    }
+                ],
+                "skus": [
+                    {
+                        "variant_values": {"Color": "Beige", "Size": "Single"},
+                        "sku": "WCBLANKET-001",
+                        "price": 1299.00,
+                        "stock": 15,
+                        "weight": 1.2
+                    },
+                    {
+                        "variant_values": {"Color": "Gray", "Size": "Double"},
+                        "sku": "WCBLANKET-002",
+                        "price": 1799.00,
+                        "stock": 10,
+                        "weight": 1.8
+                    },
+                    {
+                        "variant_values": {"Color": "Navy Blue", "Size": "King"},
+                        "sku": "WCBLANKET-003",
+                        "price": 2299.00,
+                        "stock": 8,
+                        "weight": 2.2
+                    }
+                ],
+                "rating": 4.5,
+                "reviews_count": 24,
+                "return_policy": "30 days money-back guarantee",
+                "warranty": "1 year against defects",
+                "createdAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow(),
+                "inStock": True
+            },
+            {
+                "name": "Handmade Woollen Scarf",
+                "description": "Beautiful handmade scarf in various colors. Perfect gift for winters. Each piece is unique.",
+                "base_price": 599.00,
+                "category": "Scarves",
+                "brand": "Besties Craft",
+                "images": [
+                    {
+                        "url": "/uploads/products/default-scarf.jpg",
+                        "alt_text": "Handmade Woollen Scarf",
+                        "is_primary": True
+                    }
+                ],
+                "variants": [
+                    {
+                        "name": "Color",
+                        "options": ["Red", "Green", "Purple", "Black", "White"],
+                        "is_visible": True
+                    }
+                ],
+                "skus": [
+                    {
+                        "variant_values": {"Color": "Red"},
+                        "sku": "WCSCARF-001",
+                        "price": 599.00,
+                        "stock": 20,
+                        "weight": 0.3
+                    },
+                    {
+                        "variant_values": {"Color": "Green"},
+                        "sku": "WCSCARF-002",
+                        "price": 599.00,
+                        "stock": 18,
+                        "weight": 0.3
+                    }
+                ],
+                "rating": 4.8,
+                "reviews_count": 42,
+                "return_policy": "30 days money-back guarantee",
+                "warranty": "Lifetime care advice",
+                "createdAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow(),
+                "inStock": True
+            },
+            {
+                "name": "Woollen Beanie & Gloves Set",
+                "description": "Matching woollen beanie and gloves set. Keeps you warm and stylish in winters.",
+                "base_price": 899.00,
+                "category": "Accessories",
+                "brand": "Besties Craft",
+                "images": [
+                    {
+                        "url": "/uploads/products/default-beanie.jpg",
+                        "alt_text": "Woollen Beanie & Gloves Set",
+                        "is_primary": True
+                    }
+                ],
+                "variants": [
+                    {
+                        "name": "Color",
+                        "options": ["Black", "Gray", "White", "Brown"],
+                        "is_visible": True
+                    }
+                ],
+                "skus": [
+                    {
+                        "variant_values": {"Color": "Black"},
+                        "sku": "WCBEANIE-001",
+                        "price": 899.00,
+                        "stock": 25,
+                        "weight": 0.4
+                    },
+                    {
+                        "variant_values": {"Color": "Gray"},
+                        "sku": "WCBEANIE-002",
+                        "price": 899.00,
+                        "stock": 22,
+                        "weight": 0.4
+                    }
+                ],
+                "rating": 4.6,
+                "reviews_count": 18,
+                "return_policy": "30 days money-back guarantee",
+                "warranty": "6 months against wear",
+                "createdAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow(),
+                "inStock": True
+            },
+            {
+                "name": "Decorative Woollen Wall Hanging",
+                "description": "Beautiful handcrafted woollen wall hanging. Adds warmth and character to any room.",
+                "base_price": 1099.00,
+                "category": "Home Decor",
+                "brand": "Besties Craft",
+                "images": [
+                    {
+                        "url": "/uploads/products/default-wall-hanging.jpg",
+                        "alt_text": "Decorative Woollen Wall Hanging",
+                        "is_primary": True
+                    }
+                ],
+                "variants": [
+                    {
+                        "name": "Design",
+                        "options": ["Geometric", "Floral", "Abstract", "Tribal"],
+                        "is_visible": True
+                    }
+                ],
+                "skus": [
+                    {
+                        "variant_values": {"Design": "Geometric"},
+                        "sku": "WCWALL-001",
+                        "price": 1099.00,
+                        "stock": 12,
+                        "weight": 0.8
+                    },
+                    {
+                        "variant_values": {"Design": "Floral"},
+                        "sku": "WCWALL-002",
+                        "price": 1099.00,
+                        "stock": 14,
+                        "weight": 0.8
+                    }
+                ],
+                "rating": 4.7,
+                "reviews_count": 31,
+                "return_policy": "30 days money-back guarantee",
+                "warranty": "Lifetime",
+                "createdAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow(),
+                "inStock": True
+            },
+            {
+                "name": "Premium Woollen Cushion Cover",
+                "description": "Soft and luxurious woollen cushion cover. Perfect for home furnishing and gifting.",
+                "base_price": 449.00,
+                "category": "Home Decor",
+                "brand": "Besties Craft",
+                "images": [
+                    {
+                        "url": "/uploads/products/default-cushion.jpg",
+                        "alt_text": "Premium Woollen Cushion Cover",
+                        "is_primary": True
+                    }
+                ],
+                "variants": [
+                    {
+                        "name": "Color",
+                        "options": ["Maroon", "Teal", "Gold", "Pink"],
+                        "is_visible": True
+                    },
+                    {
+                        "name": "Size",
+                        "options": ["16x16", "18x18", "20x20"],
+                        "is_visible": True
+                    }
+                ],
+                "skus": [
+                    {
+                        "variant_values": {"Color": "Maroon", "Size": "16x16"},
+                        "sku": "WCCUSH-001",
+                        "price": 449.00,
+                        "stock": 30,
+                        "weight": 0.3
+                    },
+                    {
+                        "variant_values": {"Color": "Teal", "Size": "18x18"},
+                        "sku": "WCCUSH-002",
+                        "price": 549.00,
+                        "stock": 28,
+                        "weight": 0.35
+                    }
+                ],
+                "rating": 4.4,
+                "reviews_count": 15,
+                "return_policy": "30 days money-back guarantee",
+                "warranty": "6 months",
+                "createdAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow(),
+                "inStock": True
+            }
+        ]
+        
+        result = db.products.insert_many(sample_products)
+        logger.info(f"✅ {len(result.inserted_ids)} sample products created successfully!")
+        
+        for i, product_id in enumerate(result.inserted_ids):
+            logger.info(f"   - Product {i+1}: {sample_products[i]['name']} (ID: {product_id})")
+        
+    except Exception as e:
+        logger.error(f"❌ Error creating sample products: {e}")
 
 # Connect on startup
 mongo_connected = connect_to_mongo()
@@ -165,15 +429,29 @@ async def startup_event():
     logger.info("🚀 Application starting...")
     
     if db is None:
-        logger.error("⚠️  WARNING: Database connection failed. Products endpoint may not work.")
-        logger.error("❌ CRITICAL: MongoDB is not connected. Please check your MONGO_URI environment variable.")
+        logger.error("⚠️  WARNING: Database connection failed!")
+        logger.error("❌ CRITICAL: MongoDB is not connected. Check your MONGO_URI environment variable.")
     else:
+        logger.info("✅ Database connection verified")
+        
+        # Create sample products if needed
+        create_sample_products()
+        
         try:
             product_count = db.products.count_documents({})
             order_count = db.orders.count_documents({})
             user_count = db.users.count_documents({})
             
-            logger.info(f"📦 Database stats - Products: {product_count}, Orders: {order_count}, Users: {user_count}")
+            logger.info(f"📊 DATABASE STATS:")
+            logger.info(f"   - Products: {product_count}")
+            logger.info(f"   - Orders: {order_count}")
+            logger.info(f"   - Users: {user_count}")
+            
+            if product_count == 0:
+                logger.warning("⚠️  WARNING: No products found in database!")
+            else:
+                logger.info(f"✅ Successfully loaded {product_count} products")
+                
         except Exception as e:
             logger.error(f"❌ Error fetching database stats: {e}")
 
@@ -249,7 +527,7 @@ def optimize_image(file_content: bytes, max_width: int = 1200, max_height: int =
         img.save(buffer, format='JPEG', quality=quality, optimize=True)
         buffer.seek(0)
         
-        logger.info(f"✅ Image optimized - Original size: {len(file_content)} bytes, Optimized size: {len(buffer.getvalue())} bytes")
+        logger.info(f"✅ Image optimized - Size: {len(buffer.getvalue())} bytes")
         
         return buffer.getvalue()
     except Exception as e:
@@ -321,7 +599,7 @@ def send_sms(phone_number, otp):
             to=phone_number
         )
         
-        logger.info(f"✅ SMS sent successfully to {phone_number}: {message.sid}")
+        logger.info(f"✅ SMS sent successfully to {phone_number}")
         return True
         
     except Exception as e:
@@ -332,11 +610,20 @@ def send_sms(phone_number, otp):
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with detailed status"""
     db_status = "connected" if db is not None else "disconnected"
+    product_count = 0
+    
+    if db is not None:
+        try:
+            product_count = db.products.count_documents({})
+        except:
+            pass
+    
     return {
-        "status": "ok",
+        "status": "ok" if db_status == "connected" else "error",
         "database": db_status,
+        "products_count": product_count,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -351,7 +638,7 @@ def root():
         "database_connected": db is not None
     }
 
-# ============= ENHANCED FILE UPLOAD ENDPOINTS =============
+# ============= FILE UPLOAD ENDPOINTS =============
 
 @app.post("/api/upload-image")
 async def upload_image(file: UploadFile = File(...)):
@@ -606,6 +893,8 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
     check_db_connection()
     
     try:
+        logger.info(f"📦 Fetching products - Category: {category}, Brand: {brand}, Sort: {sort}")
+        
         query = {}
         
         if category:
@@ -625,6 +914,8 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
         sort_criteria = sort_map.get(sort, [("createdAt", -1)])
         
         products = list(db.products.find(query).sort(sort_criteria))
+        
+        logger.info(f"✅ Found {len(products)} products in database")
         
         # Format products for frontend (hide exact stock counts)
         formatted_products = []
@@ -649,8 +940,6 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
                     sku.pop("stock", None)
             
             formatted_products.append(product)
-        
-        logger.info(f"📦 Retrieved {len(formatted_products)} products")
         
         return {
             "success": True,
@@ -704,7 +993,7 @@ def get_product(product_id: str):
         
         product["reviews"] = reviews
         
-        logger.info(f"📦 Retrieved product: {product['name']}")
+        logger.info(f"✅ Retrieved product: {product['name']}")
         
         return {
             "success": True,
@@ -733,7 +1022,7 @@ def create_product(product: Product, admin_token: str = Header(None)):
         result = db.products.insert_one(product_dict)
         product_dict["_id"] = str(result.inserted_id)
         
-        logger.info(f"✅ Product created: {product_dict['name']}")
+        logger.info(f"✅ Product created: {product_dict['name']} (ID: {result.inserted_id})")
         
         return {
             "success": True,
