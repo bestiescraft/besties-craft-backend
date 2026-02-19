@@ -166,6 +166,8 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
         
         for product in products:
             product["_id"] = str(product["_id"])
+            # Replace stock with in_stock boolean for customers
+            product["in_stock"] = product.get("stock", 0) > 0
             product.pop("stock", None)
             if product.get("skus"):
                 for sku in product["skus"]:
@@ -189,7 +191,8 @@ def get_product(product_id: str):
         
         product["_id"] = str(product["_id"])
         
-        # Hide stock from customers - only show in admin
+        # Replace stock with in_stock boolean for customers
+        product["in_stock"] = product.get("stock", 0) > 0
         product.pop("stock", None)
         
         reviews = list(db.reviews.find({"product_id": product_id}).limit(10))
@@ -242,6 +245,16 @@ def update_product(product_id: str, product: Product, admin_token: str = Header(
         
         product_dict = product.dict()
         product_dict["updatedAt"] = datetime.utcnow()
+        
+        # Get existing product to preserve stock if not provided
+        existing_product = db.products.find_one({"_id": ObjectId(product_id)})
+        
+        if not existing_product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        
+        # If stock is 0 in update, keep the existing stock value
+        if product_dict.get("stock") == 0 and existing_product.get("stock", 0) > 0:
+            product_dict["stock"] = existing_product.get("stock", 0)
         
         result = db.products.update_one(
             {"_id": ObjectId(product_id)},
