@@ -1,6 +1,8 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import List, Optional
 from pymongo import MongoClient
 from bson import ObjectId
 from datetime import datetime
@@ -9,6 +11,11 @@ import random
 import string
 import requests
 import hashlib
+from pathlib import Path
+
+# Create uploads directory if it doesn't exist
+UPLOAD_DIR = "uploads"
+Path(UPLOAD_DIR).mkdir(exist_ok=True)
 
 # MongoDB Connection
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -21,16 +28,58 @@ try:
 except Exception as e:
     print(f"❌ MongoDB connection failed: {e}")
 
-# Product Schema
+# ============= PYDANTIC MODELS =============
+
+class ProductVariant(BaseModel):
+    """Variant options like color, size, etc."""
+    name: str  # e.g., "Color", "Size"
+    options: List[str]  # e.g., ["Red", "Blue", "Green"]
+    is_visible: bool = True
+
+class ProductImage(BaseModel):
+    """Product images"""
+    url: str
+    alt_text: Optional[str] = None
+    is_primary: bool = False
+
+class SKUOption(BaseModel):
+    """Combination of variant options for a specific SKU"""
+    variant_values: dict  # e.g., {"Color": "Red", "Size": "M"}
+    sku: str
+    price: float
+    stock: int
+    weight: Optional[float] = None
+
 class Product(BaseModel):
     name: str
     description: str
-    price: float
-    image: str
-    stock: int = 10
+    base_price: float
+    images: List[ProductImage]
     category: str = "general"
+    variants: List[ProductVariant] = []
+    skus: List[SKUOption] = []
+    rating: float = 0
+    reviews_count: int = 0
+    brand: Optional[str] = None
+    return_policy: Optional[str] = None
+    warranty: Optional[str] = None
+
+class CartItem(BaseModel):
+    product_id: str
+    quantity: int
+    selected_variants: Optional[dict] = None  # e.g., {"Color": "Red", "Size": "M"}
+
+class Order(BaseModel):
+    user_id: str
+    items: List[CartItem]
+    shipping_address: dict
+    billing_address: Optional[dict] = None
+    payment_method: str = "razorpay"
 
 app = FastAPI()
+
+# Serve uploaded files statically
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # CORS Middleware
 app.add_middleware(
@@ -41,11 +90,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Helper function to generate OTP
+# ============= HELPER FUNCTIONS =============
+
 def generate_otp():
     return ''.join(random.choices(string.digits, k=6))
 
-# Helper function to send email with Brevo
+def get_stock_status(stock: int) -> dict:
+    """
+    Convert stock count to customer-friendly status
+    Only shows: In Stock, Low Stock, Out of Stock
+    Does NOT show exact numbers
+    """
+    if stock <= 0:
+        return {
+            "status": "Out of Stock",
+            "display": "Out of Stock",
+            "in_stock": False,
+            "is_low": False
+        }
+    elif stock <= 3:
+        return {
+            "status": "Low Stock",
+            "display": "Low Stock - Hurry!",
+            "in_stock": True,
+            "is_low": True
+        }
+    else:
+        return {
+            "status": "In Stock",
+            "display": "In Stock",
+            "in_stock": True,
+            "is_low": False
+        }
+
 def send_email(recipient_email, subject, body):
     try:
         api_key = os.getenv("BREVO_API_KEY")
@@ -83,11 +160,8 @@ def send_email(recipient_email, subject, body):
         print(f"❌ Email error: {str(e)}")
         return False
 
-
-# Helper function to send SMS with Twilio
 def send_sms(phone_number, otp):
     try:
-        import os
         from twilio.rest import Client
         
         account_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -98,11 +172,9 @@ def send_sms(phone_number, otp):
             print("❌ Twilio credentials not found in environment variables")
             return False
         
-        # ✅ FORMAT PHONE NUMBER (IMPORTANT FIX)
         phone_number = str(phone_number).strip()
         
         if not phone_number.startswith("+"):
-            # Default India country code
             phone_number = "+91" + phone_number
         
         client = Client(account_sid, auth_token)
@@ -120,77 +192,169 @@ def send_sms(phone_number, otp):
         print(f"❌ SMS error: {str(e)}")
         return False
 
+# ============= BASIC ENDPOINTS =============
 
-# Health Check
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
-# Root endpoint
 @app.get("/")
 def root():
     return {
         "message": "Besties Craft Backend API",
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "version": "2.0"
     }
+
+# ============= FILE UPLOAD ENDPOINT =============
+
+@app.post("/api/upload-image")
+async def upload_image(file: UploadFile = File(...)):
+    """
+    Upload an image file and return the URL
+    Accepts: JPG, PNG, GIF, WebP (Max 5MB)
+    """
+    try:
+        allowed_extensions = {"jpg", "jpeg", "png", "gif", "webp"}
+        file_extension = file.filename.split(".")[-1].lower()
+        
+        if file_extension not in allowed_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"File type not allowed. Allowed types: {', '.join(allowed_extensions)}"
+            )
+        
+        file_content = await file.read()
+        if len(file_content) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File size must be less than 5MB")
+        
+        timestamp = datetime.utcnow().timestamp()
+        unique_filename = f"{int(timestamp)}_{file.filename}"
+        file_path = os.path.join(UPLOAD_DIR, unique_filename)
+        
+        with open(file_path, "wb") as f:
+            f.write(file_content)
+        
+        image_url = f"/uploads/{unique_filename}"
+        
+        print(f"✅ Image uploaded successfully: {image_url}")
+        
+        return {
+            "success": True,
+            "message": "Image uploaded successfully",
+            "image_url": image_url,
+            "filename": unique_filename
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Image upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============= PRODUCTS ENDPOINTS =============
 
-# GET all products - WITH /api prefix
+# GET all products with filters
 @app.get("/api/products")
-def get_products():
+def get_products(category: Optional[str] = None, brand: Optional[str] = None, sort: str = "newest"):
     try:
-        products = list(db.products.find())
+        query = {}
+        
+        if category:
+            query["category"] = category
+        if brand:
+            query["brand"] = brand
+        
+        # Sort options
+        sort_map = {
+            "newest": [("createdAt", -1)],
+            "price_low": [("base_price", 1)],
+            "price_high": [("base_price", -1)],
+            "rating": [("rating", -1)],
+            "popular": [("reviews_count", -1)]
+        }
+        
+        sort_criteria = sort_map.get(sort, [("createdAt", -1)])
+        
+        products = list(db.products.find(query).sort(sort_criteria))
+        
+        # Format products for frontend (hide exact stock counts)
+        formatted_products = []
         for product in products:
             product["_id"] = str(product["_id"])
-        return products
+            
+            # Calculate total stock from SKUs
+            total_stock = 0
+            if product.get("skus"):
+                for sku in product["skus"]:
+                    total_stock += sku.get("stock", 0)
+            
+            # Get stock status (In Stock, Low Stock, Out of Stock)
+            stock_status = get_stock_status(total_stock)
+            product["stock_status"] = stock_status
+            product["in_stock"] = stock_status["in_stock"]
+            
+            # Remove exact stock numbers from frontend response
+            product.pop("stock", None)
+            if product.get("skus"):
+                for sku in product["skus"]:
+                    sku.pop("stock", None)
+            
+            formatted_products.append(product)
+        
+        return {
+            "success": True,
+            "count": len(formatted_products),
+            "products": formatted_products
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# GET all products - WITHOUT /api prefix (fallback)
-@app.get("/products")
-def get_products_fallback():
-    try:
-        products = list(db.products.find())
-        for product in products:
-            product["_id"] = str(product["_id"])
-        return products
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# GET single product by ID - WITH /api prefix
+# GET single product with full details
 @app.get("/api/products/{product_id}")
 def get_product(product_id: str):
     try:
-        product_id = ObjectId(product_id)
-        product = db.products.find_one({"_id": product_id})
+        product = db.products.find_one({"_id": ObjectId(product_id)})
         
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
         
         product["_id"] = str(product["_id"])
-        return product
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# GET single product by ID - WITHOUT /api prefix (fallback)
-@app.get("/products/{product_id}")
-def get_product_fallback(product_id: str):
-    try:
-        product_id = ObjectId(product_id)
-        product = db.products.find_one({"_id": product_id})
         
-        if not product:
-            raise HTTPException(status_code=404, detail="Product not found")
+        # Calculate total stock from SKUs
+        total_stock = 0
+        if product.get("skus"):
+            for sku in product["skus"]:
+                total_stock += sku.get("stock", 0)
         
-        product["_id"] = str(product["_id"])
-        return product
+        # Get stock status
+        stock_status = get_stock_status(total_stock)
+        product["stock_status"] = stock_status
+        product["in_stock"] = stock_status["in_stock"]
+        
+        # Remove exact stock numbers from frontend
+        product.pop("stock", None)
+        if product.get("skus"):
+            for sku in product["skus"]:
+                sku.pop("stock", None)
+        
+        # Get reviews for this product
+        reviews = list(db.reviews.find({"product_id": product_id}).limit(10))
+        for review in reviews:
+            review["_id"] = str(review["_id"])
+        
+        product["reviews"] = reviews
+        
+        return {
+            "success": True,
+            "product": product
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # CREATE product (Admin only)
-@app.post("/api/products")
+@app.post("/api/admin/products")
 def create_product(product: Product, admin_token: str = Header(None)):
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
@@ -199,61 +363,196 @@ def create_product(product: Product, admin_token: str = Header(None)):
         product_dict = product.dict()
         product_dict["createdAt"] = datetime.utcnow()
         product_dict["updatedAt"] = datetime.utcnow()
-        product_dict["stock"] = max(product_dict.get("stock", 10), 0)
-        product_dict["inStock"] = product_dict["stock"] > 0
+        product_dict["inStock"] = True
         
         result = db.products.insert_one(product_dict)
         product_dict["_id"] = str(result.inserted_id)
         
-        return {"message": "Product created", "product": product_dict}
+        print(f"✅ Product created: {product_dict['name']}")
+        
+        return {
+            "success": True,
+            "message": "Product created successfully",
+            "product": product_dict
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # UPDATE product (Admin only)
-@app.put("/api/products/{product_id}")
+@app.put("/api/admin/products/{product_id}")
 def update_product(product_id: str, product: Product, admin_token: str = Header(None)):
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
             raise HTTPException(status_code=401, detail="Unauthorized")
         
-        product_id = ObjectId(product_id)
         product_dict = product.dict()
         product_dict["updatedAt"] = datetime.utcnow()
-        product_dict["stock"] = max(product_dict.get("stock", 10), 0)
-        product_dict["inStock"] = product_dict["stock"] > 0
         
         result = db.products.update_one(
-            {"_id": product_id},
+            {"_id": ObjectId(product_id)},
             {"$set": product_dict}
         )
         
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
         
-        return {"message": "Product updated", "modified_count": result.modified_count}
+        print(f"✅ Product updated: {product_id}")
+        
+        return {
+            "success": True,
+            "message": "Product updated successfully",
+            "modified_count": result.modified_count
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # DELETE product (Admin only)
-@app.delete("/api/products/{product_id}")
+@app.delete("/api/admin/products/{product_id}")
 def delete_product(product_id: str, admin_token: str = Header(None)):
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
             raise HTTPException(status_code=401, detail="Unauthorized")
         
-        product_id = ObjectId(product_id)
-        result = db.products.delete_one({"_id": product_id})
+        result = db.products.delete_one({"_id": ObjectId(product_id)})
         
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
         
-        return {"message": "Product deleted"}
+        print(f"✅ Product deleted: {product_id}")
+        
+        return {
+            "success": True,
+            "message": "Product deleted successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============= PRODUCT REVIEWS =============
+
+@app.post("/api/reviews/{product_id}")
+def add_review(product_id: str, review_data: dict, authorization: str = Header(None)):
+    """
+    Add a review to a product
+    """
+    try:
+        if not authorization:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        review = {
+            "product_id": product_id,
+            "user_id": review_data.get("user_id"),
+            "rating": review_data.get("rating"),
+            "title": review_data.get("title"),
+            "comment": review_data.get("comment"),
+            "createdAt": datetime.utcnow()
+        }
+        
+        result = db.reviews.insert_one(review)
+        review["_id"] = str(result.inserted_id)
+        
+        # Update product rating
+        avg_rating = db.reviews.aggregate([
+            {"$match": {"product_id": product_id}},
+            {"$group": {"_id": None, "avg": {"$avg": "$rating"}, "count": {"$sum": 1}}}
+        ])
+        
+        avg_data = list(avg_rating)
+        if avg_data:
+            db.products.update_one(
+                {"_id": ObjectId(product_id)},
+                {"$set": {
+                    "rating": round(avg_data[0]["avg"], 2),
+                    "reviews_count": avg_data[0]["count"]
+                }}
+            )
+        
+        print(f"✅ Review added for product: {product_id}")
+        
+        return {
+            "success": True,
+            "message": "Review added successfully",
+            "review": review
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============= CART ENDPOINTS =============
+
+@app.post("/api/cart")
+def add_to_cart(cart_item: CartItem, authorization: str = Header(None)):
+    """
+    Add item to user's cart
+    """
+    try:
+        if not authorization:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        user_id = authorization.split(" ")[1] if " " in authorization else authorization
+        
+        cart_item_dict = cart_item.dict()
+        cart_item_dict["addedAt"] = datetime.utcnow()
+        
+        result = db.carts.update_one(
+            {"user_id": user_id},
+            {"$push": {"items": cart_item_dict}},
+            upsert=True
+        )
+        
+        print(f"✅ Item added to cart for user: {user_id}")
+        
+        return {
+            "success": True,
+            "message": "Item added to cart"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/cart")
+def get_cart(authorization: str = Header(None)):
+    """
+    Get user's cart
+    """
+    try:
+        if not authorization:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        user_id = authorization.split(" ")[1] if " " in authorization else authorization
+        
+        cart = db.carts.find_one({"user_id": user_id})
+        
+        if not cart:
+            return {
+                "success": True,
+                "cart": {
+                    "user_id": user_id,
+                    "items": [],
+                    "total": 0
+                }
+            }
+        
+        # Calculate total
+        total = 0
+        for item in cart.get("items", []):
+            product = db.products.find_one({"_id": ObjectId(item["product_id"])})
+            if product:
+                total += product.get("base_price", 0) * item.get("quantity", 1)
+        
+        return {
+            "success": True,
+            "cart": {
+                "user_id": user_id,
+                "items": cart.get("items", []),
+                "total": total
+            }
+        }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= AUTH ENDPOINTS =============
 
-# SEND OTP
 @app.post("/api/auth/send-otp")
 def send_otp(data: dict):
     try:
@@ -297,13 +596,11 @@ def send_otp(data: dict):
             </html>
             """
             email_sent = send_email(email, "Besties Craft - Your OTP", email_body)
-            
             if not email_sent:
                 raise HTTPException(status_code=500, detail="Failed to send email")
         
         elif login_method == "phone":
             sms_sent = send_sms(phone, otp)
-            
             if not sms_sent:
                 raise HTTPException(status_code=500, detail="Failed to send SMS")
         
@@ -319,7 +616,6 @@ def send_otp(data: dict):
         print(f"❌ Send OTP Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# VERIFY OTP
 @app.post("/api/auth/verify-otp")
 def verify_otp(data: dict):
     try:
@@ -357,7 +653,7 @@ def verify_otp(data: dict):
             "lastLogin": datetime.utcnow()
         }
         
-        result = db.users.update_one(
+        db.users.update_one(
             {login_method: identifier},
             {"$set": user_data},
             upsert=True
@@ -385,7 +681,6 @@ def verify_otp(data: dict):
         print(f"❌ Verify OTP Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Admin Login - FIXED VERSION
 @app.post("/api/auth/admin-login")
 def admin_login(credentials: dict):
     try:
@@ -420,39 +715,40 @@ def admin_login(credentials: dict):
 
 # ============= ORDERS ENDPOINTS =============
 
-@app.post("/api/orders/create")
-def create_order(order_data: dict, authorization: str = Header(None)):
+@app.post("/api/orders")
+def create_order(order: Order, authorization: str = Header(None)):
     try:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing or invalid token")
+        if not authorization:
+            raise HTTPException(status_code=401, detail="Unauthorized")
         
-        token = authorization.split(" ")[1]
+        order_dict = order.dict()
+        order_dict["status"] = "pending"
+        order_dict["createdAt"] = datetime.utcnow()
         
-        if not token or len(token) < 10:
-            raise HTTPException(status_code=401, detail="Invalid token")
+        # Calculate total
+        total = 0
+        for item in order_dict.get("items", []):
+            product = db.products.find_one({"_id": ObjectId(item["product_id"])})
+            if product:
+                total += product.get("base_price", 0) * item.get("quantity", 1)
         
-        order = {
-            "user_id": order_data.get("user_id"),
-            "items": order_data.get("items", []),
-            "total_amount": order_data.get("total_amount", 0),
-            "status": "pending",
-            "createdAt": datetime.utcnow()
-        }
+        order_dict["total_amount"] = total
         
-        result = db.orders.insert_one(order)
-        order["_id"] = str(result.inserted_id)
+        result = db.orders.insert_one(order_dict)
+        order_dict["_id"] = str(result.inserted_id)
+        
+        print(f"✅ Order created: {order_dict['_id']}")
         
         return {
             "success": True,
-            "order": order,
+            "message": "Order created successfully",
+            "order": order_dict,
             "razorpay_order": {
                 "id": f"order_{result.inserted_id}",
-                "amount": int(order["total_amount"] * 100)
+                "amount": int(total * 100)
             }
         }
         
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -466,9 +762,96 @@ def verify_payment(payment_data: dict):
             {"$set": {"status": "completed", "paidAt": datetime.utcnow()}}
         )
         
+        print(f"✅ Payment verified for order: {order_id}")
+        
         return {
             "success": True,
-            "message": "Payment verified"
+            "message": "Payment verified successfully"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/orders")
+def get_all_orders(admin_token: str = Header(None)):
+    try:
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        orders = list(db.orders.find().sort("createdAt", -1))
+        for order in orders:
+            order["_id"] = str(order["_id"])
+        
+        return {
+            "success": True,
+            "count": len(orders),
+            "orders": orders
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/orders/{order_id}")
+def update_order_status(order_id: str, status_data: dict, admin_token: str = Header(None)):
+    try:
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        new_status = status_data.get("status")
+        
+        result = db.orders.update_one(
+            {"_id": ObjectId(order_id)},
+            {"$set": {
+                "status": new_status,
+                "updatedAt": datetime.utcnow()
+            }}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
+        print(f"✅ Order status updated: {order_id} -> {new_status}")
+        
+        return {
+            "success": True,
+            "message": f"Order status updated to {new_status}"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============= ADMIN DASHBOARD STATS =============
+
+@app.get("/api/admin/dashboard-stats")
+def get_dashboard_stats(admin_token: str = Header(None)):
+    try:
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        total_products = db.products.count_documents({})
+        total_orders = db.orders.count_documents({})
+        total_customers = db.users.count_documents({})
+        
+        # Calculate total revenue
+        revenue_data = list(db.orders.aggregate([
+            {"$match": {"status": "completed"}},
+            {"$group": {"_id": None, "total": {"$sum": "$total_amount"}}}
+        ]))
+        total_revenue = revenue_data[0]["total"] if revenue_data else 0
+        
+        # Get order status breakdown
+        order_status = list(db.orders.aggregate([
+            {"$group": {"_id": "$status", "count": {"$sum": 1}}}
+        ]))
+        
+        return {
+            "success": True,
+            "stats": {
+                "total_products": total_products,
+                "total_orders": total_orders,
+                "total_customers": total_customers,
+                "total_revenue": total_revenue,
+                "order_status": {item["_id"]: item["count"] for item in order_status}
+            }
         }
         
     except Exception as e:
