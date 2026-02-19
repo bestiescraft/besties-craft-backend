@@ -418,7 +418,7 @@ def send_otp(data: dict):
         
         identifier = email if email else phone
         
-        otp = ''.join([str(random.randint(0, 9)) for _ in range(6))])
+        otp = ''.join([str(random.randint(0, 9)) for _ in range(6)])
         
         otp_record = {
             "identifier": identifier,
