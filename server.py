@@ -185,7 +185,6 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
         
         for product in products:
             product["_id"] = str(product["_id"])
-            # Replace stock with in_stock boolean for customers
             product["in_stock"] = product.get("stock", 0) > 0
             product.pop("stock", None)
             if product.get("skus"):
@@ -209,8 +208,6 @@ def get_product(product_id: str):
             raise HTTPException(status_code=404, detail="Product not found")
         
         product["_id"] = str(product["_id"])
-        
-        # Replace stock with in_stock boolean for customers
         product["in_stock"] = product.get("stock", 0) > 0
         product.pop("stock", None)
         
@@ -229,23 +226,17 @@ def get_product(product_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============= ADMIN PRODUCTS - FIXED FOR STOCK ISSUE =============
+# ============= ADMIN PRODUCTS =============
 
 @app.post("/api/admin/products")
 def create_product(product: Product, admin_token: str = Header(None)):
     try:
-        # Check if admin_token exists - any valid token from login endpoint is accepted
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
         
         product_dict = product.dict()
         product_dict["createdAt"] = datetime.utcnow()
         product_dict["updatedAt"] = datetime.utcnow()
-        
-        # Ensure stock is properly set
-        product_dict["stock"] = int(product_dict.get("stock", 0))
-        
-        print(f"DEBUG: Creating product with stock = {product_dict['stock']}")
         
         result = db.products.insert_one(product_dict)
         product_dict["_id"] = str(result.inserted_id)
@@ -263,17 +254,11 @@ def create_product(product: Product, admin_token: str = Header(None)):
 @app.put("/api/admin/products/{product_id}")
 def update_product(product_id: str, product: Product, admin_token: str = Header(None)):
     try:
-        # Check if admin_token exists - any valid token from login endpoint is accepted
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
         
         product_dict = product.dict()
         product_dict["updatedAt"] = datetime.utcnow()
-        
-        # Ensure stock is properly set as integer
-        product_dict["stock"] = int(product_dict.get("stock", 0))
-        
-        print(f"DEBUG: Updating product {product_id} with stock = {product_dict['stock']}")
         
         result = db.products.update_one(
             {"_id": ObjectId(product_id)},
@@ -295,7 +280,6 @@ def update_product(product_id: str, product: Product, admin_token: str = Header(
 @app.delete("/api/admin/products/{product_id}")
 def delete_product(product_id: str, admin_token: str = Header(None)):
     try:
-        # Check if admin_token exists - any valid token from login endpoint is accepted
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
         
@@ -593,12 +577,11 @@ def verify_payment(payment_data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============= ADMIN ORDERS - FIXED =============
+# ============= ADMIN ORDERS =============
 
 @app.get("/api/admin/orders")
 def get_all_orders(admin_token: str = Header(None)):
     try:
-        # Check if admin_token exists - any valid token from login endpoint is accepted
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
         
@@ -619,7 +602,6 @@ def get_all_orders(admin_token: str = Header(None)):
 @app.put("/api/admin/orders/{order_id}")
 def update_order_status(order_id: str, status_data: dict, admin_token: str = Header(None)):
     try:
-        # Check if admin_token exists - any valid token from login endpoint is accepted
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
         
@@ -639,12 +621,11 @@ def update_order_status(order_id: str, status_data: dict, admin_token: str = Hea
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============= DASHBOARD - FIXED =============
+# ============= DASHBOARD =============
 
 @app.get("/api/admin/dashboard-stats")
 def get_dashboard_stats(admin_token: str = Header(None)):
     try:
-        # Check if admin_token exists - any valid token from login endpoint is accepted
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
         
