@@ -1,19 +1,16 @@
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 from pymongo import MongoClient
 from bson import ObjectId
 from datetime import datetime
 import os
-from pathlib import Path
 import random
+import cloudinary
+import cloudinary.uploader
 
 # ============= SETUP =============
-
-UPLOAD_DIR = "uploads"
-Path(UPLOAD_DIR).mkdir(exist_ok=True)
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "besties_craft_db")
@@ -21,6 +18,13 @@ DATABASE_NAME = os.getenv("DATABASE_NAME", "besties_craft_db")
 # Connect to MongoDB
 client = MongoClient(MONGO_URI)
 db = client[DATABASE_NAME]
+
+# Cloudinary config
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET")
+)
 
 app = FastAPI(title="Besties Craft API", version="2.0")
 
@@ -32,9 +36,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Static files
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ============= MODELS =============
 
@@ -62,7 +63,6 @@ class Product(BaseModel):
     images: List[ProductImage]
     category: str = "general"
     stock: int = 0
-    # ✅ FIX 3: Added colors field — was missing, so colors were being dropped on save!
     colors: List[str] = []
     variants: List[ProductVariant] = []
     skus: List[SKUOption] = []
@@ -111,38 +111,32 @@ def health_check():
             "products_count": 0
         }
 
-# ============= FILE UPLOAD =============
+# ============= FILE UPLOAD (Cloudinary) =============
 
-# ✅ FIX 2: Upload now returns a FULL absolute URL using the backend base URL
-# so images don't break when frontend is on a different domain (localhost vs Render)
 @app.post("/api/upload-image")
 async def upload_image(file: UploadFile = File(...)):
     try:
         allowed_extensions = {"jpg", "jpeg", "png", "gif", "webp"}
         file_extension = file.filename.split(".")[-1].lower()
-        
+
         if file_extension not in allowed_extensions:
             raise HTTPException(status_code=400, detail="File type not allowed")
-        
+
         file_content = await file.read()
         if len(file_content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large")
-        
-        timestamp = datetime.utcnow().timestamp()
-        unique_filename = f"{int(timestamp)}_{file.filename}"
-        file_path = os.path.join(UPLOAD_DIR, unique_filename)
-        
-        with open(file_path, "wb") as f:
-            f.write(file_content)
+            raise HTTPException(status_code=400, detail="File too large (max 10MB)")
 
-        # Build absolute URL so frontend can always reach the image
-        backend_url = os.getenv("BACKEND_URL", "https://besties-craft-backend-1.onrender.com")
-        full_url = f"{backend_url}/uploads/{unique_filename}"
-        
+        # Upload to Cloudinary — permanent, never deleted on redeploy
+        result = cloudinary.uploader.upload(
+            file_content,
+            folder="besties-craft-products",
+            resource_type="image"
+        )
+
         return {
             "success": True,
-            "image_url": full_url,   # ← full URL now, not just /uploads/...
-            "filename": unique_filename
+            "image_url": result["secure_url"],  # permanent HTTPS URL
+            "filename": result["public_id"]
         }
     except HTTPException:
         raise
@@ -156,11 +150,11 @@ def get_admin_products(admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
-        
+
         products = list(db.products.find())
         for product in products:
             product["_id"] = str(product["_id"])
-        
+
         return {
             "success": True,
             "products": products
@@ -174,12 +168,12 @@ def get_admin_products(admin_token: str = Header(None)):
 def get_products(category: Optional[str] = None, brand: Optional[str] = None, sort: str = "newest"):
     try:
         query = {}
-        
+
         if category:
             query["category"] = category
         if brand:
             query["brand"] = brand
-        
+
         sort_map = {
             "newest": [("createdAt", -1)],
             "price_low": [("base_price", 1)],
@@ -187,17 +181,17 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
             "rating": [("rating", -1)],
             "popular": [("reviews_count", -1)]
         }
-        
+
         sort_criteria = sort_map.get(sort, [("createdAt", -1)])
         products = list(db.products.find(query).sort(sort_criteria))
-        
+
         for product in products:
             product["_id"] = str(product["_id"])
             product["in_stock"] = product.get("stock", 0) > 0
             if product.get("skus"):
                 for sku in product["skus"]:
                     sku.pop("stock", None)
-        
+
         return {
             "success": True,
             "count": len(products),
@@ -210,19 +204,19 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
 def get_product(product_id: str):
     try:
         product = db.products.find_one({"_id": ObjectId(product_id)})
-        
+
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
-        
+
         product["_id"] = str(product["_id"])
         product["in_stock"] = product.get("stock", 0) > 0
-        
+
         reviews = list(db.reviews.find({"product_id": product_id}).limit(10))
         for review in reviews:
             review["_id"] = str(review["_id"])
-        
+
         product["reviews"] = reviews
-        
+
         return {
             "success": True,
             "product": product
@@ -239,14 +233,14 @@ def create_product(product: Product, admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
-        
+
         product_dict = product.dict()
         product_dict["createdAt"] = datetime.utcnow()
         product_dict["updatedAt"] = datetime.utcnow()
-        
+
         result = db.products.insert_one(product_dict)
         product_dict["_id"] = str(result.inserted_id)
-        
+
         return {
             "success": True,
             "message": "Product created",
@@ -262,18 +256,18 @@ def update_product(product_id: str, product: Product, admin_token: str = Header(
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
-        
+
         product_dict = product.dict()
         product_dict["updatedAt"] = datetime.utcnow()
-        
+
         result = db.products.update_one(
             {"_id": ObjectId(product_id)},
             {"$set": product_dict}
         )
-        
+
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
-        
+
         return {
             "success": True,
             "message": "Product updated"
@@ -288,12 +282,12 @@ def delete_product(product_id: str, admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
-        
+
         result = db.products.delete_one({"_id": ObjectId(product_id)})
-        
+
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
-        
+
         return {
             "success": True,
             "message": "Product deleted"
@@ -310,7 +304,7 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        
+
         review = {
             "product_id": product_id,
             "user_id": review_data.get("user_id"),
@@ -319,15 +313,15 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
             "comment": review_data.get("comment"),
             "createdAt": datetime.utcnow()
         }
-        
+
         result = db.reviews.insert_one(review)
         review["_id"] = str(result.inserted_id)
-        
+
         avg_rating = db.reviews.aggregate([
             {"$match": {"product_id": product_id}},
             {"$group": {"_id": None, "avg": {"$avg": "$rating"}, "count": {"$sum": 1}}}
         ])
-        
+
         avg_data = list(avg_rating)
         if avg_data:
             db.products.update_one(
@@ -337,7 +331,7 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
                     "reviews_count": avg_data[0]["count"]
                 }}
             )
-        
+
         return {
             "success": True,
             "review": review
@@ -354,22 +348,22 @@ def add_to_cart(cart_item: CartItem, authorization: str = Header(None)):
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        
+
         user_id = authorization.split(" ")[1] if " " in authorization else authorization
-        
+
         product = db.products.find_one({"_id": ObjectId(cart_item.product_id)})
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
-        
+
         cart_item_dict = cart_item.dict()
         cart_item_dict["addedAt"] = datetime.utcnow()
-        
+
         db.carts.update_one(
             {"user_id": user_id},
             {"$push": {"items": cart_item_dict}},
             upsert=True
         )
-        
+
         return {"success": True, "message": "Item added to cart"}
     except HTTPException:
         raise
@@ -381,17 +375,17 @@ def get_cart(authorization: str = Header(None)):
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        
+
         user_id = authorization.split(" ")[1] if " " in authorization else authorization
-        
+
         cart = db.carts.find_one({"user_id": user_id})
-        
+
         if not cart:
             return {
                 "success": True,
                 "cart": {"user_id": user_id, "items": [], "total": 0}
             }
-        
+
         total = 0
         for item in cart.get("items", []):
             try:
@@ -400,7 +394,7 @@ def get_cart(authorization: str = Header(None)):
                     total += product.get("base_price", 0) * item.get("quantity", 1)
             except:
                 pass
-        
+
         return {
             "success": True,
             "cart": {
@@ -421,24 +415,66 @@ def send_otp(data: dict):
     try:
         email = data.get("email")
         phone = data.get("phone")
-        
+
         if not email and not phone:
             raise HTTPException(status_code=400, detail="Email or phone required")
-        
+
         identifier = email if email else phone
-        
+
         otp = ''.join([str(random.randint(0, 9)) for _ in range(6)])
-        
+
         otp_record = {
             "identifier": identifier,
             "otp": otp,
             "createdAt": datetime.utcnow(),
             "expiresAt": datetime.utcnow().timestamp() + 600
         }
-        
+
         db.otps.delete_many({"identifier": identifier})
         db.otps.insert_one(otp_record)
-        
+
+        # Send email OTP via Brevo SMTP
+        if email:
+            try:
+                import smtplib
+                from email.mime.text import MIMEText
+                from email.mime.multipart import MIMEMultipart
+
+                smtp_host = os.getenv("SMTP_HOST", "smtp-relay.brevo.com")
+                smtp_port = int(os.getenv("SMTP_PORT", 587))
+                smtp_user = os.getenv("SMTP_USER")
+                smtp_pass = os.getenv("SMTP_PASS")
+                email_from = os.getenv("EMAIL_FROM", "bestiescraft1434@email.com")
+
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = "Your Besties Craft OTP"
+                msg["From"] = email_from
+                msg["To"] = email
+
+                html_body = f"""
+                <html>
+                <body style="font-family: Arial, sans-serif; padding: 20px;">
+                    <h2 style="color: #e91e8c;">Besties Craft</h2>
+                    <p>Your OTP for login is:</p>
+                    <h1 style="color: #333; letter-spacing: 8px;">{otp}</h1>
+                    <p>This OTP is valid for <strong>10 minutes</strong>.</p>
+                    <p style="color: #999; font-size: 12px;">If you didn't request this, please ignore this email.</p>
+                </body>
+                </html>
+                """
+
+                msg.attach(MIMEText(html_body, "html"))
+
+                with smtplib.SMTP(smtp_host, smtp_port) as server:
+                    server.starttls()
+                    server.login(smtp_user, smtp_pass)
+                    server.sendmail(email_from, email, msg.as_string())
+
+                print(f"OTP email sent successfully to {email}")
+            except Exception as email_error:
+                print(f"Email sending failed: {email_error}")
+                # Don't fail the request — OTP is still saved in DB
+
         return {
             "success": True,
             "message": "OTP sent",
@@ -455,43 +491,43 @@ def verify_otp(data: dict):
         email = data.get("email")
         phone = data.get("phone")
         otp_entered = str(data.get("otp", "")).strip()
-        
+
         identifier = email if email else phone
-        
+
         if not identifier or not otp_entered:
             raise HTTPException(status_code=400, detail="Missing data")
-        
+
         otp_record = db.otps.find_one({"identifier": identifier})
-        
+
         if not otp_record:
             raise HTTPException(status_code=401, detail="OTP expired")
-        
+
         if datetime.utcnow().timestamp() > otp_record.get("expiresAt", 0):
             db.otps.delete_one({"_id": otp_record["_id"]})
             raise HTTPException(status_code=401, detail="OTP expired")
-        
+
         if str(otp_record["otp"]) != otp_entered:
             raise HTTPException(status_code=401, detail="Invalid OTP")
-        
+
         db.otps.delete_one({"_id": otp_record["_id"]})
-        
+
         user_data = {
             "email": email if email else None,
             "phone": phone if phone else None,
             "lastLogin": datetime.utcnow()
         }
-        
+
         db.users.update_one(
             {"$or": [{"email": email}, {"phone": phone}]},
             {"$set": user_data},
             upsert=True
         )
-        
+
         user = db.users.find_one({"$or": [{"email": email}, {"phone": phone}]})
         user_id = str(user["_id"]) if user else None
-        
+
         token = __import__('hashlib').sha256(f"{user_id}{identifier}{datetime.utcnow()}".encode()).hexdigest()
-        
+
         return {
             "success": True,
             "token": token,
@@ -510,16 +546,16 @@ def verify_otp(data: dict):
 def admin_login(credentials: dict):
     try:
         password = credentials.get("password")
-        
+
         if not password:
             raise HTTPException(status_code=400, detail="Password required")
-        
+
         admin_password = os.getenv("ADMIN_PASSWORD", "Bhola143")
-        
+
         if password == admin_password:
             admin_email = os.getenv("ADMIN_EMAIL", "bestiescraft1434@gmail.com")
             token = __import__('hashlib').sha256(f"{admin_email}{datetime.utcnow()}".encode()).hexdigest()
-            
+
             return {
                 "success": True,
                 "token": token,
@@ -539,23 +575,23 @@ def create_order(order: Order, authorization: str = Header(None)):
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        
+
         order_dict = order.dict()
         order_dict["status"] = "pending"
         order_dict["createdAt"] = datetime.utcnow()
-        
+
         total = 0
         for item in order_dict.get("items", []):
             product = db.products.find_one({"_id": ObjectId(item["product_id"])})
             if not product:
                 raise HTTPException(status_code=404, detail="Product not found")
             total += product.get("base_price", 0) * item.get("quantity", 1)
-        
+
         order_dict["total_amount"] = total
-        
+
         result = db.orders.insert_one(order_dict)
         order_dict["_id"] = str(result.inserted_id)
-        
+
         return {
             "success": True,
             "order": order_dict,
@@ -573,12 +609,12 @@ def create_order(order: Order, authorization: str = Header(None)):
 def verify_payment(payment_data: dict):
     try:
         order_id = payment_data.get("order_id")
-        
+
         db.orders.update_one(
             {"_id": ObjectId(order_id)},
             {"$set": {"status": "completed", "paidAt": datetime.utcnow()}}
         )
-        
+
         return {"success": True, "message": "Payment verified"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -590,11 +626,11 @@ def get_all_orders(admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
-        
+
         orders = list(db.orders.find().sort("createdAt", -1))
         for order in orders:
             order["_id"] = str(order["_id"])
-        
+
         return {
             "success": True,
             "count": len(orders),
@@ -610,17 +646,17 @@ def update_order_status(order_id: str, status_data: dict, admin_token: str = Hea
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
-        
+
         new_status = status_data.get("status")
-        
+
         result = db.orders.update_one(
             {"_id": ObjectId(order_id)},
             {"$set": {"status": new_status, "updatedAt": datetime.utcnow()}}
         )
-        
+
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Order not found")
-        
+
         return {"success": True, "message": "Order updated"}
     except HTTPException:
         raise
@@ -634,21 +670,21 @@ def get_dashboard_stats(admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
-        
+
         total_products = db.products.count_documents({})
         total_orders = db.orders.count_documents({})
         total_customers = db.users.count_documents({})
-        
+
         revenue_data = list(db.orders.aggregate([
             {"$match": {"status": "completed"}},
             {"$group": {"_id": None, "total": {"$sum": "$total_amount"}}}
         ]))
         total_revenue = revenue_data[0]["total"] if revenue_data else 0
-        
+
         order_status = list(db.orders.aggregate([
             {"$group": {"_id": "$status", "count": {"$sum": 1}}}
         ]))
-        
+
         return {
             "success": True,
             "stats": {
