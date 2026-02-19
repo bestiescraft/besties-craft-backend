@@ -385,29 +385,37 @@ def verify_otp(data: dict):
         print(f"❌ Verify OTP Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Admin Login
+# Admin Login - FIXED VERSION
 @app.post("/api/auth/admin-login")
 def admin_login(credentials: dict):
     try:
-        username = credentials.get("username")
         password = credentials.get("password")
         
-        admin_email = os.getenv("ADMIN_EMAIL", "admin@besties.com")
+        admin_email = os.getenv("ADMIN_EMAIL", "bestiescraft1434@gmail.com")
         admin_password = os.getenv("ADMIN_PASSWORD", "Bhola143")
         
-        if username == admin_email and password == admin_password:
+        if not password:
+            raise HTTPException(status_code=400, detail="Password is required")
+        
+        if password == admin_password:
             token = hashlib.sha256(f"{admin_email}{datetime.utcnow()}".encode()).hexdigest()
+            
+            print(f"✅ Admin login successful for {admin_email}")
             
             return {
                 "success": True,
                 "message": "Login successful",
-                "token": token
+                "token": token,
+                "email": admin_email
             }
         else:
+            print(f"❌ Invalid admin password attempt")
             raise HTTPException(status_code=401, detail="Invalid credentials")
+            
     except HTTPException:
         raise
     except Exception as e:
+        print(f"❌ Admin Login Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= ORDERS ENDPOINTS =============
