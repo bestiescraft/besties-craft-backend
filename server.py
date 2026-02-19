@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from pymongo import MongoClient
+from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure
 from bson import ObjectId
 from datetime import datetime
 import os
@@ -12,28 +14,87 @@ import string
 import requests
 import hashlib
 from pathlib import Path
+import logging
+from PIL import Image
+from io import BytesIO
+import shutil
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Create uploads directory if it doesn't exist
 UPLOAD_DIR = "uploads"
 Path(UPLOAD_DIR).mkdir(exist_ok=True)
 
-# MongoDB Connection
+# Create subdirectories for different file types
+PRODUCT_IMAGES_DIR = os.path.join(UPLOAD_DIR, "products")
+TEMP_DIR = os.path.join(UPLOAD_DIR, "temp")
+Path(PRODUCT_IMAGES_DIR).mkdir(exist_ok=True)
+Path(TEMP_DIR).mkdir(exist_ok=True)
+
+logger.info(f"📁 Upload directories configured:")
+logger.info(f"   - Main: {UPLOAD_DIR}")
+logger.info(f"   - Products: {PRODUCT_IMAGES_DIR}")
+logger.info(f"   - Temp: {TEMP_DIR}")
+
+# ============= DATABASE CONFIGURATION =============
+
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "besties_craft_db")
 
-try:
-    client = MongoClient(MONGO_URI)
-    db = client[DATABASE_NAME]
-    print("✅ MongoDB connected successfully")
-except Exception as e:
-    print(f"❌ MongoDB connection failed: {e}")
+db = None
+client = None
+
+def connect_to_mongo():
+    """Establish MongoDB connection with proper error handling"""
+    global client, db
+    try:
+        logger.info(f"🔄 Connecting to MongoDB: {MONGO_URI.split('@')[0]}***")
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        
+        # Verify connection
+        client.admin.command('ping')
+        db = client[DATABASE_NAME]
+        
+        logger.info("✅ MongoDB connected successfully")
+        logger.info(f"📊 Database: {DATABASE_NAME}")
+        
+        # List existing collections
+        collections = db.list_collection_names()
+        logger.info(f"📦 Collections found: {collections}")
+        
+        # Create indexes for better query performance
+        try:
+            db.products.create_index("category")
+            db.products.create_index("brand")
+            db.products.create_index("rating")
+            db.orders.create_index("user_id")
+            db.users.create_index("email", unique=True, sparse=True)
+            db.users.create_index("phone", unique=True, sparse=True)
+            logger.info("✅ Database indexes created")
+        except Exception as e:
+            logger.warning(f"⚠️  Index creation warning: {e}")
+        
+        return True
+        
+    except (ServerSelectionTimeoutError, ConnectionFailure) as e:
+        logger.error(f"❌ MongoDB connection failed: {e}")
+        logger.error(f"⚠️  Make sure MONGO_URI is set correctly")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Unexpected error connecting to MongoDB: {e}")
+        return False
+
+# Connect on startup
+mongo_connected = connect_to_mongo()
 
 # ============= PYDANTIC MODELS =============
 
 class ProductVariant(BaseModel):
     """Variant options like color, size, etc."""
-    name: str  # e.g., "Color", "Size"
-    options: List[str]  # e.g., ["Red", "Blue", "Green"]
+    name: str
+    options: List[str]
     is_visible: bool = True
 
 class ProductImage(BaseModel):
@@ -44,7 +105,7 @@ class ProductImage(BaseModel):
 
 class SKUOption(BaseModel):
     """Combination of variant options for a specific SKU"""
-    variant_values: dict  # e.g., {"Color": "Red", "Size": "M"}
+    variant_values: dict
     sku: str
     price: float
     stock: int
@@ -67,7 +128,7 @@ class Product(BaseModel):
 class CartItem(BaseModel):
     product_id: str
     quantity: int
-    selected_variants: Optional[dict] = None  # e.g., {"Color": "Red", "Size": "M"}
+    selected_variants: Optional[dict] = None
 
 class Order(BaseModel):
     user_id: str
@@ -76,7 +137,13 @@ class Order(BaseModel):
     billing_address: Optional[dict] = None
     payment_method: str = "razorpay"
 
-app = FastAPI()
+# ============= FASTAPI APP INITIALIZATION =============
+
+app = FastAPI(
+    title="Besties Craft Backend API",
+    description="E-commerce backend for handmade woolies",
+    version="2.0"
+)
 
 # Serve uploaded files statically
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
@@ -90,9 +157,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============= STARTUP & SHUTDOWN EVENTS =============
+
+@app.on_event("startup")
+async def startup_event():
+    """Run on application startup"""
+    logger.info("🚀 Application starting...")
+    
+    if db is None:
+        logger.error("⚠️  WARNING: Database connection failed. Products endpoint may not work.")
+        logger.error("❌ CRITICAL: MongoDB is not connected. Please check your MONGO_URI environment variable.")
+    else:
+        try:
+            product_count = db.products.count_documents({})
+            order_count = db.orders.count_documents({})
+            user_count = db.users.count_documents({})
+            
+            logger.info(f"📦 Database stats - Products: {product_count}, Orders: {order_count}, Users: {user_count}")
+        except Exception as e:
+            logger.error(f"❌ Error fetching database stats: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Run on application shutdown"""
+    global client
+    if client:
+        client.close()
+        logger.info("🔌 MongoDB connection closed")
+
 # ============= HELPER FUNCTIONS =============
 
+def check_db_connection():
+    """Check if database is connected"""
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection failed. Please try again later."
+        )
+
 def generate_otp():
+    """Generate a 6-digit OTP"""
     return ''.join(random.choices(string.digits, k=6))
 
 def get_stock_status(stock: int) -> dict:
@@ -123,12 +227,42 @@ def get_stock_status(stock: int) -> dict:
             "is_low": False
         }
 
+def optimize_image(file_content: bytes, max_width: int = 1200, max_height: int = 1200, quality: int = 85) -> bytes:
+    """Optimize image: resize, compress, and convert to appropriate format"""
+    try:
+        # Open image
+        img = Image.open(BytesIO(file_content))
+        
+        # Convert RGBA to RGB if needed
+        if img.mode == 'RGBA':
+            rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+            rgb_img.paste(img, mask=img.split()[3] if len(img.split()) == 4 else None)
+            img = rgb_img
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Resize if necessary
+        img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        
+        # Save optimized image
+        buffer = BytesIO()
+        img.save(buffer, format='JPEG', quality=quality, optimize=True)
+        buffer.seek(0)
+        
+        logger.info(f"✅ Image optimized - Original size: {len(file_content)} bytes, Optimized size: {len(buffer.getvalue())} bytes")
+        
+        return buffer.getvalue()
+    except Exception as e:
+        logger.warning(f"⚠️  Image optimization failed: {e}, using original")
+        return file_content
+
 def send_email(recipient_email, subject, body):
+    """Send email via Brevo API"""
     try:
         api_key = os.getenv("BREVO_API_KEY")
         
         if not api_key:
-            print("❌ BREVO_API_KEY not found in environment variables")
+            logger.warning("⚠️  BREVO_API_KEY not found in environment variables")
             return False
         
         message = {
@@ -146,21 +280,23 @@ def send_email(recipient_email, subject, body):
         response = requests.post(
             "https://api.brevo.com/v3/smtp/email",
             json=message,
-            headers=headers
+            headers=headers,
+            timeout=10
         )
         
         if response.status_code == 201:
-            print(f"✅ Email sent successfully to {recipient_email}")
+            logger.info(f"✅ Email sent successfully to {recipient_email}")
             return True
         else:
-            print(f"❌ Email error: {response.status_code} - {response.text}")
+            logger.error(f"❌ Email error: {response.status_code} - {response.text}")
             return False
             
     except Exception as e:
-        print(f"❌ Email error: {str(e)}")
+        logger.error(f"❌ Email error: {str(e)}")
         return False
 
 def send_sms(phone_number, otp):
+    """Send SMS via Twilio API"""
     try:
         from twilio.rest import Client
         
@@ -169,7 +305,7 @@ def send_sms(phone_number, otp):
         twilio_phone = os.getenv("TWILIO_PHONE_NUMBER")
         
         if not all([account_sid, auth_token, twilio_phone]):
-            print("❌ Twilio credentials not found in environment variables")
+            logger.warning("⚠️  Twilio credentials not found in environment variables")
             return False
         
         phone_number = str(phone_number).strip()
@@ -185,35 +321,44 @@ def send_sms(phone_number, otp):
             to=phone_number
         )
         
-        print(f"✅ SMS sent successfully to {phone_number}: {message.sid}")
+        logger.info(f"✅ SMS sent successfully to {phone_number}: {message.sid}")
         return True
         
     except Exception as e:
-        print(f"❌ SMS error: {str(e)}")
+        logger.error(f"❌ SMS error: {str(e)}")
         return False
 
 # ============= BASIC ENDPOINTS =============
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    """Health check endpoint"""
+    db_status = "connected" if db is not None else "disconnected"
+    return {
+        "status": "ok",
+        "database": db_status,
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
 @app.get("/")
 def root():
+    """Root endpoint with API information"""
     return {
         "message": "Besties Craft Backend API",
         "docs": "/docs",
         "health": "/health",
-        "version": "2.0"
+        "version": "2.0",
+        "database_connected": db is not None
     }
 
-# ============= FILE UPLOAD ENDPOINT =============
+# ============= ENHANCED FILE UPLOAD ENDPOINTS =============
 
 @app.post("/api/upload-image")
 async def upload_image(file: UploadFile = File(...)):
     """
-    Upload an image file and return the URL
-    Accepts: JPG, PNG, GIF, WebP (Max 5MB)
+    Upload a single image file and return the URL
+    Accepts: JPG, PNG, GIF, WebP (Max 10MB)
+    Automatically optimizes and compresses images
     """
     try:
         allowed_extensions = {"jpg", "jpeg", "png", "gif", "webp"}
@@ -226,38 +371,240 @@ async def upload_image(file: UploadFile = File(...)):
             )
         
         file_content = await file.read()
-        if len(file_content) > 5 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File size must be less than 5MB")
+        if len(file_content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File size must be less than 10MB")
         
+        # Optimize image
+        optimized_content = optimize_image(file_content)
+        
+        # Save with timestamp and original filename
         timestamp = datetime.utcnow().timestamp()
         unique_filename = f"{int(timestamp)}_{file.filename}"
-        file_path = os.path.join(UPLOAD_DIR, unique_filename)
+        file_path = os.path.join(PRODUCT_IMAGES_DIR, unique_filename)
         
         with open(file_path, "wb") as f:
-            f.write(file_content)
+            f.write(optimized_content)
         
-        image_url = f"/uploads/{unique_filename}"
+        image_url = f"/uploads/products/{unique_filename}"
         
-        print(f"✅ Image uploaded successfully: {image_url}")
+        logger.info(f"✅ Image uploaded successfully: {image_url}")
         
         return {
             "success": True,
             "message": "Image uploaded successfully",
             "image_url": image_url,
-            "filename": unique_filename
+            "filename": unique_filename,
+            "file_size": len(optimized_content)
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Image upload error: {str(e)}")
+        logger.error(f"❌ Image upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/upload-multiple-images")
+async def upload_multiple_images(files: List[UploadFile] = File(...)):
+    """
+    Upload multiple image files at once
+    Accepts up to 10 images, each max 10MB
+    """
+    try:
+        if len(files) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 images allowed per upload")
+        
+        allowed_extensions = {"jpg", "jpeg", "png", "gif", "webp"}
+        uploaded_images = []
+        
+        for file in files:
+            file_extension = file.filename.split(".")[-1].lower()
+            
+            if file_extension not in allowed_extensions:
+                logger.warning(f"⚠️  Skipping unsupported file: {file.filename}")
+                continue
+            
+            file_content = await file.read()
+            if len(file_content) > 10 * 1024 * 1024:
+                logger.warning(f"⚠️  File too large, skipping: {file.filename}")
+                continue
+            
+            # Optimize image
+            optimized_content = optimize_image(file_content)
+            
+            # Save file
+            timestamp = datetime.utcnow().timestamp()
+            unique_filename = f"{int(timestamp)}_{file.filename}"
+            file_path = os.path.join(PRODUCT_IMAGES_DIR, unique_filename)
+            
+            with open(file_path, "wb") as f:
+                f.write(optimized_content)
+            
+            image_url = f"/uploads/products/{unique_filename}"
+            
+            uploaded_images.append({
+                "success": True,
+                "image_url": image_url,
+                "filename": unique_filename,
+                "file_size": len(optimized_content)
+            })
+        
+        if not uploaded_images:
+            raise HTTPException(status_code=400, detail="No valid images were uploaded")
+        
+        logger.info(f"✅ {len(uploaded_images)} images uploaded successfully")
+        
+        return {
+            "success": True,
+            "message": f"{len(uploaded_images)} images uploaded successfully",
+            "count": len(uploaded_images),
+            "images": uploaded_images
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Multiple image upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/upload-product-image")
+async def upload_product_image(
+    file: UploadFile = File(...),
+    admin_token: str = Header(None)
+):
+    """
+    Admin endpoint to upload product image
+    Requires admin authentication
+    """
+    try:
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        allowed_extensions = {"jpg", "jpeg", "png", "gif", "webp"}
+        file_extension = file.filename.split(".")[-1].lower()
+        
+        if file_extension not in allowed_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"File type not allowed. Allowed types: {', '.join(allowed_extensions)}"
+            )
+        
+        file_content = await file.read()
+        if len(file_content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File size must be less than 10MB")
+        
+        # Optimize image
+        optimized_content = optimize_image(file_content)
+        
+        # Save file
+        timestamp = datetime.utcnow().timestamp()
+        unique_filename = f"{int(timestamp)}_{file.filename}"
+        file_path = os.path.join(PRODUCT_IMAGES_DIR, unique_filename)
+        
+        with open(file_path, "wb") as f:
+            f.write(optimized_content)
+        
+        image_url = f"/uploads/products/{unique_filename}"
+        
+        logger.info(f"✅ Product image uploaded by admin: {image_url}")
+        
+        return {
+            "success": True,
+            "message": "Product image uploaded successfully",
+            "image_url": image_url,
+            "filename": unique_filename,
+            "file_size": len(optimized_content)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Admin image upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/admin/delete-image/{filename}")
+def delete_image(filename: str, admin_token: str = Header(None)):
+    """
+    Admin endpoint to delete a product image
+    Requires admin authentication
+    """
+    try:
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        # Prevent directory traversal attacks
+        if ".." in filename or "/" in filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        
+        file_path = os.path.join(PRODUCT_IMAGES_DIR, filename)
+        
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="Image not found")
+        
+        os.remove(file_path)
+        
+        logger.info(f"✅ Image deleted: {filename}")
+        
+        return {
+            "success": True,
+            "message": "Image deleted successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Image delete error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/uploaded-images")
+def get_uploaded_images(admin_token: str = Header(None)):
+    """
+    Get list of all uploaded product images
+    Requires admin authentication
+    """
+    try:
+        if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        images = []
+        
+        if os.path.exists(PRODUCT_IMAGES_DIR):
+            for filename in os.listdir(PRODUCT_IMAGES_DIR):
+                file_path = os.path.join(PRODUCT_IMAGES_DIR, filename)
+                if os.path.isfile(file_path):
+                    file_size = os.path.getsize(file_path)
+                    file_modified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                    
+                    images.append({
+                        "filename": filename,
+                        "url": f"/uploads/products/{filename}",
+                        "size": file_size,
+                        "modified": file_modified.isoformat()
+                    })
+        
+        # Sort by most recent first
+        images.sort(key=lambda x: x["modified"], reverse=True)
+        
+        logger.info(f"📦 Retrieved {len(images)} uploaded images")
+        
+        return {
+            "success": True,
+            "count": len(images),
+            "images": images
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error fetching uploaded images: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= PRODUCTS ENDPOINTS =============
 
-# GET all products with filters
 @app.get("/api/products")
 def get_products(category: Optional[str] = None, brand: Optional[str] = None, sort: str = "newest"):
+    """Get all products with optional filters and sorting"""
+    check_db_connection()
+    
     try:
         query = {}
         
@@ -303,19 +650,30 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
             
             formatted_products.append(product)
         
+        logger.info(f"📦 Retrieved {len(formatted_products)} products")
+        
         return {
             "success": True,
             "count": len(formatted_products),
             "products": formatted_products
         }
     except Exception as e:
+        logger.error(f"❌ Error fetching products: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# GET single product with full details
 @app.get("/api/products/{product_id}")
 def get_product(product_id: str):
+    """Get single product with full details"""
+    check_db_connection()
+    
     try:
-        product = db.products.find_one({"_id": ObjectId(product_id)})
+        # Validate ObjectId
+        try:
+            obj_id = ObjectId(product_id)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid product ID format")
+        
+        product = db.products.find_one({"_id": obj_id})
         
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -346,16 +704,23 @@ def get_product(product_id: str):
         
         product["reviews"] = reviews
         
+        logger.info(f"📦 Retrieved product: {product['name']}")
+        
         return {
             "success": True,
             "product": product
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error fetching product: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# CREATE product (Admin only)
 @app.post("/api/admin/products")
 def create_product(product: Product, admin_token: str = Header(None)):
+    """Create a new product (Admin only)"""
+    check_db_connection()
+    
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -368,75 +733,103 @@ def create_product(product: Product, admin_token: str = Header(None)):
         result = db.products.insert_one(product_dict)
         product_dict["_id"] = str(result.inserted_id)
         
-        print(f"✅ Product created: {product_dict['name']}")
+        logger.info(f"✅ Product created: {product_dict['name']}")
         
         return {
             "success": True,
             "message": "Product created successfully",
             "product": product_dict
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error creating product: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# UPDATE product (Admin only)
 @app.put("/api/admin/products/{product_id}")
 def update_product(product_id: str, product: Product, admin_token: str = Header(None)):
+    """Update a product (Admin only)"""
+    check_db_connection()
+    
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        try:
+            obj_id = ObjectId(product_id)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid product ID format")
         
         product_dict = product.dict()
         product_dict["updatedAt"] = datetime.utcnow()
         
         result = db.products.update_one(
-            {"_id": ObjectId(product_id)},
+            {"_id": obj_id},
             {"$set": product_dict}
         )
         
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
         
-        print(f"✅ Product updated: {product_id}")
+        logger.info(f"✅ Product updated: {product_id}")
         
         return {
             "success": True,
             "message": "Product updated successfully",
             "modified_count": result.modified_count
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error updating product: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# DELETE product (Admin only)
 @app.delete("/api/admin/products/{product_id}")
 def delete_product(product_id: str, admin_token: str = Header(None)):
+    """Delete a product (Admin only)"""
+    check_db_connection()
+    
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
             raise HTTPException(status_code=401, detail="Unauthorized")
         
-        result = db.products.delete_one({"_id": ObjectId(product_id)})
+        try:
+            obj_id = ObjectId(product_id)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid product ID format")
+        
+        result = db.products.delete_one({"_id": obj_id})
         
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
         
-        print(f"✅ Product deleted: {product_id}")
+        logger.info(f"✅ Product deleted: {product_id}")
         
         return {
             "success": True,
             "message": "Product deleted successfully"
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error deleting product: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= PRODUCT REVIEWS =============
 
 @app.post("/api/reviews/{product_id}")
 def add_review(product_id: str, review_data: dict, authorization: str = Header(None)):
-    """
-    Add a review to a product
-    """
+    """Add a review to a product"""
+    check_db_connection()
+    
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
+        
+        try:
+            obj_id = ObjectId(product_id)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid product ID format")
         
         review = {
             "product_id": product_id,
@@ -459,14 +852,14 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
         avg_data = list(avg_rating)
         if avg_data:
             db.products.update_one(
-                {"_id": ObjectId(product_id)},
+                {"_id": obj_id},
                 {"$set": {
                     "rating": round(avg_data[0]["avg"], 2),
                     "reviews_count": avg_data[0]["count"]
                 }}
             )
         
-        print(f"✅ Review added for product: {product_id}")
+        logger.info(f"✅ Review added for product: {product_id}")
         
         return {
             "success": True,
@@ -474,21 +867,33 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
             "review": review
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error adding review: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= CART ENDPOINTS =============
 
 @app.post("/api/cart")
 def add_to_cart(cart_item: CartItem, authorization: str = Header(None)):
-    """
-    Add item to user's cart
-    """
+    """Add item to user's cart"""
+    check_db_connection()
+    
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
         
         user_id = authorization.split(" ")[1] if " " in authorization else authorization
+        
+        # Validate product exists
+        try:
+            obj_id = ObjectId(cart_item.product_id)
+            product = db.products.find_one({"_id": obj_id})
+            if not product:
+                raise HTTPException(status_code=404, detail="Product not found")
+        except:
+            raise HTTPException(status_code=400, detail="Invalid product ID")
         
         cart_item_dict = cart_item.dict()
         cart_item_dict["addedAt"] = datetime.utcnow()
@@ -499,21 +904,24 @@ def add_to_cart(cart_item: CartItem, authorization: str = Header(None)):
             upsert=True
         )
         
-        print(f"✅ Item added to cart for user: {user_id}")
+        logger.info(f"✅ Item added to cart for user: {user_id}")
         
         return {
             "success": True,
             "message": "Item added to cart"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error adding to cart: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/cart")
 def get_cart(authorization: str = Header(None)):
-    """
-    Get user's cart
-    """
+    """Get user's cart"""
+    check_db_connection()
+    
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -535,9 +943,12 @@ def get_cart(authorization: str = Header(None)):
         # Calculate total
         total = 0
         for item in cart.get("items", []):
-            product = db.products.find_one({"_id": ObjectId(item["product_id"])})
-            if product:
-                total += product.get("base_price", 0) * item.get("quantity", 1)
+            try:
+                product = db.products.find_one({"_id": ObjectId(item["product_id"])})
+                if product:
+                    total += product.get("base_price", 0) * item.get("quantity", 1)
+            except:
+                pass
         
         return {
             "success": True,
@@ -548,13 +959,19 @@ def get_cart(authorization: str = Header(None)):
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error fetching cart: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= AUTH ENDPOINTS =============
 
 @app.post("/api/auth/send-otp")
 def send_otp(data: dict):
+    """Send OTP to email or phone"""
+    check_db_connection()
+    
     try:
         email = data.get("email")
         phone = data.get("phone")
@@ -565,7 +982,7 @@ def send_otp(data: dict):
         identifier = email if email else phone
         login_method = "email" if email else "phone"
         
-        print(f"📧 Sending OTP to {login_method}: {identifier}")
+        logger.info(f"📧 Sending OTP to {login_method}: {identifier}")
         
         otp = generate_otp()
         
@@ -579,7 +996,7 @@ def send_otp(data: dict):
         
         db.otps.delete_many({"identifier": identifier})
         db.otps.insert_one(otp_record)
-        print(f"✅ OTP stored in database: {otp}")
+        logger.info(f"✅ OTP stored in database: {otp}")
         
         if login_method == "email":
             email_body = f"""
@@ -597,12 +1014,12 @@ def send_otp(data: dict):
             """
             email_sent = send_email(email, "Besties Craft - Your OTP", email_body)
             if not email_sent:
-                raise HTTPException(status_code=500, detail="Failed to send email")
+                logger.warning("⚠️  Email sending failed, but OTP was stored")
         
         elif login_method == "phone":
             sms_sent = send_sms(phone, otp)
             if not sms_sent:
-                raise HTTPException(status_code=500, detail="Failed to send SMS")
+                logger.warning("⚠️  SMS sending failed, but OTP was stored")
         
         return {
             "success": True,
@@ -613,11 +1030,14 @@ def send_otp(data: dict):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Send OTP Error: {str(e)}")
+        logger.error(f"❌ Send OTP Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/auth/verify-otp")
 def verify_otp(data: dict):
+    """Verify OTP and login user"""
+    check_db_connection()
+    
     try:
         email = data.get("email")
         phone = data.get("phone")
@@ -629,7 +1049,7 @@ def verify_otp(data: dict):
         if not identifier or not otp_entered:
             raise HTTPException(status_code=400, detail="Missing email/phone or OTP")
         
-        print(f"🔍 Verifying OTP for {login_method}: {identifier}")
+        logger.info(f"🔍 Verifying OTP for {login_method}: {identifier}")
         
         otp_record = db.otps.find_one({"identifier": identifier})
         
@@ -641,10 +1061,10 @@ def verify_otp(data: dict):
             raise HTTPException(status_code=401, detail="OTP has expired")
         
         if str(otp_record["otp"]) != otp_entered:
-            print(f"❌ Invalid OTP. Expected: {otp_record['otp']}, Got: {otp_entered}")
+            logger.warning(f"❌ Invalid OTP. Expected: {otp_record['otp']}, Got: {otp_entered}")
             raise HTTPException(status_code=401, detail="Invalid OTP")
         
-        print(f"✅ OTP verified successfully!")
+        logger.info(f"✅ OTP verified successfully!")
         
         db.otps.delete_one({"_id": otp_record["_id"]})
         
@@ -678,11 +1098,12 @@ def verify_otp(data: dict):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Verify OTP Error: {str(e)}")
+        logger.error(f"❌ Verify OTP Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/auth/admin-login")
 def admin_login(credentials: dict):
+    """Admin login endpoint"""
     try:
         password = credentials.get("password")
         
@@ -695,7 +1116,7 @@ def admin_login(credentials: dict):
         if password == admin_password:
             token = hashlib.sha256(f"{admin_email}{datetime.utcnow()}".encode()).hexdigest()
             
-            print(f"✅ Admin login successful for {admin_email}")
+            logger.info(f"✅ Admin login successful for {admin_email}")
             
             return {
                 "success": True,
@@ -704,19 +1125,22 @@ def admin_login(credentials: dict):
                 "email": admin_email
             }
         else:
-            print(f"❌ Invalid admin password attempt")
+            logger.warning(f"❌ Invalid admin password attempt")
             raise HTTPException(status_code=401, detail="Invalid credentials")
             
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Admin Login Error: {str(e)}")
+        logger.error(f"❌ Admin Login Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= ORDERS ENDPOINTS =============
 
 @app.post("/api/orders")
 def create_order(order: Order, authorization: str = Header(None)):
+    """Create a new order"""
+    check_db_connection()
+    
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -725,19 +1149,23 @@ def create_order(order: Order, authorization: str = Header(None)):
         order_dict["status"] = "pending"
         order_dict["createdAt"] = datetime.utcnow()
         
-        # Calculate total
+        # Calculate total and validate products
         total = 0
         for item in order_dict.get("items", []):
-            product = db.products.find_one({"_id": ObjectId(item["product_id"])})
-            if product:
+            try:
+                product = db.products.find_one({"_id": ObjectId(item["product_id"])})
+                if not product:
+                    raise HTTPException(status_code=404, detail=f"Product {item['product_id']} not found")
                 total += product.get("base_price", 0) * item.get("quantity", 1)
+            except:
+                raise HTTPException(status_code=400, detail="Invalid product in order")
         
         order_dict["total_amount"] = total
         
         result = db.orders.insert_one(order_dict)
         order_dict["_id"] = str(result.inserted_id)
         
-        print(f"✅ Order created: {order_dict['_id']}")
+        logger.info(f"✅ Order created: {order_dict['_id']}")
         
         return {
             "success": True,
@@ -749,31 +1177,51 @@ def create_order(order: Order, authorization: str = Header(None)):
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error creating order: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/orders/verify-payment")
 def verify_payment(payment_data: dict):
+    """Verify payment for an order"""
+    check_db_connection()
+    
     try:
         order_id = payment_data.get("order_id")
         
-        db.orders.update_one(
-            {"_id": ObjectId(order_id)},
+        try:
+            obj_id = ObjectId(order_id)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid order ID")
+        
+        result = db.orders.update_one(
+            {"_id": obj_id},
             {"$set": {"status": "completed", "paidAt": datetime.utcnow()}}
         )
         
-        print(f"✅ Payment verified for order: {order_id}")
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
+        logger.info(f"✅ Payment verified for order: {order_id}")
         
         return {
             "success": True,
             "message": "Payment verified successfully"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error verifying payment: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/admin/orders")
 def get_all_orders(admin_token: str = Header(None)):
+    """Get all orders (Admin only)"""
+    check_db_connection()
+    
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -782,24 +1230,40 @@ def get_all_orders(admin_token: str = Header(None)):
         for order in orders:
             order["_id"] = str(order["_id"])
         
+        logger.info(f"📦 Retrieved {len(orders)} orders")
+        
         return {
             "success": True,
             "count": len(orders),
             "orders": orders
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error fetching orders: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/admin/orders/{order_id}")
 def update_order_status(order_id: str, status_data: dict, admin_token: str = Header(None)):
+    """Update order status (Admin only)"""
+    check_db_connection()
+    
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
             raise HTTPException(status_code=401, detail="Unauthorized")
         
+        try:
+            obj_id = ObjectId(order_id)
+        except:
+            raise HTTPException(status_code=400, detail="Invalid order ID")
+        
         new_status = status_data.get("status")
         
+        if not new_status:
+            raise HTTPException(status_code=400, detail="Status is required")
+        
         result = db.orders.update_one(
-            {"_id": ObjectId(order_id)},
+            {"_id": obj_id},
             {"$set": {
                 "status": new_status,
                 "updatedAt": datetime.utcnow()
@@ -809,20 +1273,26 @@ def update_order_status(order_id: str, status_data: dict, admin_token: str = Hea
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Order not found")
         
-        print(f"✅ Order status updated: {order_id} -> {new_status}")
+        logger.info(f"✅ Order status updated: {order_id} -> {new_status}")
         
         return {
             "success": True,
             "message": f"Order status updated to {new_status}"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error updating order: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= ADMIN DASHBOARD STATS =============
 
 @app.get("/api/admin/dashboard-stats")
 def get_dashboard_stats(admin_token: str = Header(None)):
+    """Get dashboard statistics (Admin only)"""
+    check_db_connection()
+    
     try:
         if admin_token != os.getenv("ADMIN_TOKEN", "your-secret-token"):
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -843,6 +1313,8 @@ def get_dashboard_stats(admin_token: str = Header(None)):
             {"$group": {"_id": "$status", "count": {"$sum": 1}}}
         ]))
         
+        logger.info(f"📊 Dashboard stats retrieved")
+        
         return {
             "success": True,
             "stats": {
@@ -854,10 +1326,24 @@ def get_dashboard_stats(admin_token: str = Header(None)):
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Error fetching dashboard stats: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ============= APPLICATION ENTRY POINT =============
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    logger.info(f"🚀 Starting Besties Craft Backend API on port {port}")
+    logger.info(f"📚 API Documentation available at http://localhost:{port}/docs")
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
