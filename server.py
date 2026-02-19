@@ -143,6 +143,25 @@ async def upload_image(file: UploadFile = File(...)):
 
 # ============= PRODUCTS ENDPOINTS =============
 
+@app.get("/api/admin/products")
+def get_admin_products(admin_token: str = Header(None)):
+    try:
+        if not admin_token:
+            raise HTTPException(status_code=401, detail="Unauthorized - No token provided")
+        
+        products = list(db.products.find())
+        for product in products:
+            product["_id"] = str(product["_id"])
+        
+        return {
+            "success": True,
+            "products": products
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/products")
 def get_products(category: Optional[str] = None, brand: Optional[str] = None, sort: str = "newest"):
     try:
