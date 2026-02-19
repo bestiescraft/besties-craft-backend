@@ -10,3 +10,4 @@ twilio
 slowapi
 python-multipart
 aiofiles
+Pillow
