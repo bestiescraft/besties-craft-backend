@@ -210,7 +210,7 @@ def get_product(product_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============= ADMIN PRODUCTS - FIXED =============
+# ============= ADMIN PRODUCTS - FIXED FOR STOCK ISSUE =============
 
 @app.post("/api/admin/products")
 def create_product(product: Product, admin_token: str = Header(None)):
@@ -222,6 +222,11 @@ def create_product(product: Product, admin_token: str = Header(None)):
         product_dict = product.dict()
         product_dict["createdAt"] = datetime.utcnow()
         product_dict["updatedAt"] = datetime.utcnow()
+        
+        # Ensure stock is properly set
+        product_dict["stock"] = int(product_dict.get("stock", 0))
+        
+        print(f"DEBUG: Creating product with stock = {product_dict['stock']}")
         
         result = db.products.insert_one(product_dict)
         product_dict["_id"] = str(result.inserted_id)
@@ -246,15 +251,10 @@ def update_product(product_id: str, product: Product, admin_token: str = Header(
         product_dict = product.dict()
         product_dict["updatedAt"] = datetime.utcnow()
         
-        # Get existing product to preserve stock if not provided
-        existing_product = db.products.find_one({"_id": ObjectId(product_id)})
+        # Ensure stock is properly set as integer
+        product_dict["stock"] = int(product_dict.get("stock", 0))
         
-        if not existing_product:
-            raise HTTPException(status_code=404, detail="Product not found")
-        
-        # If stock is 0 in update, keep the existing stock value
-        if product_dict.get("stock") == 0 and existing_product.get("stock", 0) > 0:
-            product_dict["stock"] = existing_product.get("stock", 0)
+        print(f"DEBUG: Updating product {product_id} with stock = {product_dict['stock']}")
         
         result = db.products.update_one(
             {"_id": ObjectId(product_id)},
@@ -418,7 +418,7 @@ def send_otp(data: dict):
         
         identifier = email if email else phone
         
-        otp = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+        otp = ''.join([str(random.randint(0, 9)) for _ in range(6))])
         
         otp_record = {
             "identifier": identifier,
