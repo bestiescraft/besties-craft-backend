@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import List, Optional, Union
 from pymongo import MongoClient
 from bson import ObjectId
@@ -34,28 +34,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============= CATEGORY HELPERS =============
+# ============= HELPERS =============
 
-VALID_CATEGORIES = {
-    'bracelets', 'handmade-flowers', 'keychains',
-    'hair-accessories', 'gifting-items', 'crafts'
-}
+def normalise_categories(raw) -> List[str]:
+    """
+    Always return a clean list of category strings.
+    Handles: str, List[str], comma-separated str, None.
+    """
+    if raw is None:
+        return ["general"]
+    if isinstance(raw, list):
+        flat = []
+        for item in raw:
+            for part in str(item).split(","):
+                part = part.strip()
+                if part:
+                    flat.append(part)
+        return flat if flat else ["general"]
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        return parts if parts else ["general"]
+    return ["general"]
 
-def normalize_category_field(raw):
-    if not raw:
-        return []
-    cats = raw if isinstance(raw, list) else [raw]
-    return [
-        c.strip().lower().replace(" ", "-")
-        for c in cats
-        if c.strip().lower().replace(" ", "-") in VALID_CATEGORIES
-    ]
-
-def prep_product(p):
-    p["_id"]        = str(p["_id"])
-    p["in_stock"]   = p.get("stock", 0) > 0
-    p["categories"] = normalize_category_field(p.get("category"))
-    p["category"]   = p["categories"][0] if p["categories"] else ""
+def fix_product_out(p: dict) -> dict:
+    """Ensure every product going to the client has categories as a list."""
+    p["_id"] = str(p["_id"])
+    # normalise category → categories (list)
+    raw = p.get("categories") or p.get("category")
+    p["categories"] = normalise_categories(raw)
+    # keep legacy "category" as first item so old frontend code doesn't break
+    p["category"] = p["categories"][0] if p["categories"] else "general"
+    p["in_stock"] = p.get("stock", 0) > 0
     return p
 
 # ============= MODELS =============
@@ -82,7 +91,9 @@ class Product(BaseModel):
     description: str
     base_price: float
     images: List[ProductImage]
-    category: Optional[Union[str, List[str]]] = "general"
+    # ── categories: accepts either a list OR a single string from old admin forms
+    categories: Optional[Union[List[str], str]] = None
+    category:   Optional[Union[List[str], str]] = None   # legacy field — accepted but normalised
     stock: int = 0
     colors: List[str] = []
     variants: List[ProductVariant] = []
@@ -92,6 +103,13 @@ class Product(BaseModel):
     brand: Optional[str] = None
     warranty: Optional[str] = None
 
+    @validator("categories", pre=True, always=True)
+    def normalise_cats(cls, v, values):
+        # merge both fields, prefer categories
+        raw = v if v is not None else values.get("category")
+        return normalise_categories(raw)
+
+# ─── CartItem carries colour + customisation ───
 class CartItem(BaseModel):
     product_id: str
     product_name: Optional[str] = None
@@ -110,14 +128,14 @@ class OrderItem(BaseModel):
     customisation: Optional[str] = None
 
 class ShippingDetails(BaseModel):
-    fullName: Optional[str] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    address: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
+    fullName:   Optional[str] = None
+    email:      Optional[str] = None
+    phone:      Optional[str] = None
+    address:    Optional[str] = None
+    city:       Optional[str] = None
+    state:      Optional[str] = None
     postalCode: Optional[str] = None
-    country: Optional[str] = "India"
+    country:    Optional[str] = "India"
 
 class CreateOrderRequest(BaseModel):
     user_id: str
@@ -146,6 +164,47 @@ def health_check():
         return {"status": "ok", "database": "connected", "products_count": product_count}
     except:
         return {"status": "error", "database": "disconnected", "products_count": 0}
+
+# ============= ONE-TIME MIGRATION =============
+
+@app.post("/api/admin/migrate-categories")
+def migrate_categories(admin_token: str = Header(None)):
+    """
+    Run once after deploy.
+    Converts every product whose 'category' is a plain string
+    into a 'categories' list, and keeps both fields in sync.
+    """
+    try:
+        if not admin_token:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        products = list(db.products.find())
+        updated = 0
+        for p in products:
+            raw_cats = p.get("categories")
+            raw_cat  = p.get("category")
+
+            # Already a proper list — just make sure both fields exist
+            if isinstance(raw_cats, list) and len(raw_cats) > 0:
+                first = raw_cats[0]
+                db.products.update_one(
+                    {"_id": p["_id"]},
+                    {"$set": {"categories": raw_cats, "category": first}}
+                )
+            else:
+                # Convert old string category to list
+                cats = normalise_categories(raw_cat or raw_cats)
+                db.products.update_one(
+                    {"_id": p["_id"]},
+                    {"$set": {"categories": cats, "category": cats[0]}}
+                )
+            updated += 1
+
+        return {"success": True, "message": f"Migrated {updated} products"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============= FILE UPLOAD =============
 
@@ -181,9 +240,7 @@ def get_admin_products(admin_token: str = Header(None)):
             raise HTTPException(status_code=401, detail="Unauthorized")
         products = list(db.products.find())
         for p in products:
-            p["_id"]        = str(p["_id"])
-            p["categories"] = normalize_category_field(p.get("category"))
-            p["category"]   = p["categories"][0] if p["categories"] else p.get("category", "")
+            fix_product_out(p)
         return {"success": True, "products": products}
     except HTTPException:
         raise
@@ -194,8 +251,15 @@ def get_admin_products(admin_token: str = Header(None)):
 def get_products(category: Optional[str] = None, brand: Optional[str] = None, sort: str = "newest"):
     try:
         query = {}
+
         if category:
-            query["category"] = {"$in": [category]}
+            # Match products where the requested category appears in the categories LIST
+            # Also fall back to matching the legacy 'category' string field
+            query["$or"] = [
+                {"categories": {"$in": [category]}},
+                {"category": category}
+            ]
+
         if brand:
             query["brand"] = brand
 
@@ -207,7 +271,8 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
             "popular":    [("reviews_count", -1)]
         }
         products = list(db.products.find(query).sort(sort_map.get(sort, [("createdAt", -1)])))
-        products = [prep_product(p) for p in products]
+        for p in products:
+            fix_product_out(p)
         return {"success": True, "count": len(products), "products": products}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -219,7 +284,7 @@ def get_product(product_id: str):
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
 
-        product = prep_product(product)
+        fix_product_out(product)
 
         reviews = list(db.reviews.find({"product_id": product_id}).sort("createdAt", -1).limit(20))
         for r in reviews:
@@ -237,7 +302,13 @@ def create_product(product: Product, admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
+
         product_dict = product.dict()
+        # Normalise categories
+        cats = normalise_categories(product_dict.get("categories") or product_dict.get("category"))
+        product_dict["categories"] = cats
+        product_dict["category"]   = cats[0]   # keep legacy field as first category
+
         product_dict["createdAt"] = datetime.utcnow()
         product_dict["updatedAt"] = datetime.utcnow()
         result = db.products.insert_one(product_dict)
@@ -253,7 +324,13 @@ def update_product(product_id: str, product: Product, admin_token: str = Header(
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
+
         product_dict = product.dict()
+        # Normalise categories
+        cats = normalise_categories(product_dict.get("categories") or product_dict.get("category"))
+        product_dict["categories"] = cats
+        product_dict["category"]   = cats[0]
+
         product_dict["updatedAt"] = datetime.utcnow()
         result = db.products.update_one({"_id": ObjectId(product_id)}, {"$set": product_dict})
         if result.matched_count == 0:
@@ -287,12 +364,14 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         review = {
-            "product_id": product_id,
-            "user_id":    review_data.get("user_id"),
-            "rating":     review_data.get("rating"),
-            "title":      review_data.get("title"),
-            "comment":    review_data.get("comment"),
-            "createdAt":  datetime.utcnow()
+            "product_id":    product_id,
+            "user_id":       review_data.get("user_id"),
+            "reviewer_name": review_data.get("reviewer_name"),
+            "user_email":    review_data.get("user_email"),
+            "rating":        review_data.get("rating"),
+            "title":         review_data.get("title"),
+            "comment":       review_data.get("comment"),
+            "createdAt":     datetime.utcnow()
         }
         result = db.reviews.insert_one(review)
         review["_id"] = str(result.inserted_id)
@@ -324,122 +403,17 @@ def get_reviews(product_id: str):
 
 # ============= AUTH =============
 
-def _send_email_otp(to_email: str, otp: str):
-    """
-    Send OTP via Brevo SMTP.
-    Raises HTTPException with clear message if anything is wrong.
-    """
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-
-    smtp_host  = os.getenv("SMTP_HOST",  "smtp-relay.brevo.com")
-    smtp_port  = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user  = os.getenv("SMTP_USER")   # your Brevo login email e.g. yourname@gmail.com
-    smtp_pass  = os.getenv("SMTP_PASS")   # Brevo SMTP password (NOT your login password)
-    email_from = os.getenv("EMAIL_FROM",  "bestiescraft1434@gmail.com")
-
-    # ── Fail clearly if credentials missing ──────────────────────────
-    if not smtp_user:
-        raise HTTPException(status_code=500,
-            detail="SMTP_USER not set in Render env vars. Set it to your Brevo login email.")
-    if not smtp_pass:
-        raise HTTPException(status_code=500,
-            detail="SMTP_PASS not set in Render env vars. Set it to your Brevo SMTP password.")
-
-    msg            = MIMEMultipart("alternative")
-    msg["Subject"] = "Your Besties Craft OTP"
-    msg["From"]    = f"Besties Craft <{email_from}>"
-    msg["To"]      = to_email
-
-    html_body = f"""
-    <html>
-    <body style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#faf7f2;">
-      <div style="text-align:center;margin-bottom:24px;">
-        <h2 style="font-family:Georgia,serif;color:#2c1810;margin:0;">
-          Besties <span style="color:#c2602a;font-style:italic;">Craft</span>
-        </h2>
-        <p style="color:#9a8070;font-size:13px;margin:4px 0 0;">Handcrafted in India</p>
-      </div>
-      <div style="background:#fff;border-radius:16px;padding:32px;border:1px solid #e8dfd0;text-align:center;">
-        <p style="color:#4a3728;margin:0 0 20px;">Your login OTP is:</p>
-        <div style="font-size:42px;font-weight:700;letter-spacing:16px;color:#2c1810;font-family:Georgia,serif;">
-          {otp}
-        </div>
-        <p style="color:#9a8070;font-size:13px;margin:20px 0 0;">
-          Valid for <strong>10 minutes</strong>. Do not share this with anyone.
-        </p>
-      </div>
-      <p style="color:#ccc;font-size:11px;text-align:center;margin-top:20px;">
-        If you didn't request this, you can safely ignore this email.
-      </p>
-    </body>
-    </html>
-    """
-    msg.attach(MIMEText(html_body, "html"))
-
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(email_from, to_email, msg.as_string())
-    except smtplib.SMTPAuthenticationError:
-        raise HTTPException(status_code=500,
-            detail="SMTP authentication failed. Check SMTP_USER and SMTP_PASS in Render env vars.")
-    except smtplib.SMTPException as e:
-        raise HTTPException(status_code=500, detail=f"SMTP error: {str(e)}")
-
-
-def _send_phone_otp(to_phone: str, otp: str):
-    """
-    Send OTP via Twilio SMS.
-    Uses TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER from Render env vars.
-    Raises HTTPException with clear message if anything is wrong.
-    """
-    account_sid   = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token    = os.getenv("TWILIO_AUTH_TOKEN")
-    from_number   = os.getenv("TWILIO_PHONE_NUMBER")
-
-    if not account_sid or not auth_token or not from_number:
-        raise HTTPException(status_code=500,
-            detail="Twilio env vars missing. Need TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.")
-
-    # Format Indian number: 9876543210 → +919876543210
-    phone_digits = to_phone.strip().replace(" ", "").replace("-", "")
-    if not phone_digits.startswith("+"):
-        phone_digits = "+91" + phone_digits.lstrip("0")
-
-    try:
-        from twilio.rest import Client as TwilioClient
-        twilio_client = TwilioClient(account_sid, auth_token)
-        message = twilio_client.messages.create(
-            body=f"Your Besties Craft OTP is: {otp}\nValid for 10 minutes. Do not share this.",
-            from_=from_number,
-            to=phone_digits
-        )
-        print(f"[Twilio] SMS sent to {phone_digits}, SID: {message.sid}")
-    except ImportError:
-        raise HTTPException(status_code=500,
-            detail="twilio package not installed. Add 'twilio' to requirements.txt")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Twilio SMS failed: {str(e)}")
-
-
 @app.post("/api/auth/send-otp")
 def send_otp(data: dict):
     try:
         email = data.get("email")
         phone = data.get("phone")
-
         if not email and not phone:
             raise HTTPException(status_code=400, detail="Email or phone required")
 
         identifier = email if email else phone
         otp = ''.join([str(random.randint(0, 9)) for _ in range(6)])
 
-        # Store OTP in DB
         db.otps.delete_many({"identifier": identifier})
         db.otps.insert_one({
             "identifier": identifier,
@@ -449,18 +423,45 @@ def send_otp(data: dict):
         })
 
         if email:
-            _send_email_otp(email, otp)   # raises HTTPException on failure
+            try:
+                import smtplib
+                from email.mime.text import MIMEText
+                from email.mime.multipart import MIMEMultipart
 
-        if phone:
-            _send_phone_otp(phone, otp)   # raises HTTPException on failure
+                smtp_host  = os.getenv("SMTP_HOST", "smtp-relay.brevo.com")
+                smtp_port  = int(os.getenv("SMTP_PORT", 587))
+                smtp_user  = os.getenv("SMTP_USER")
+                smtp_pass  = os.getenv("SMTP_PASS")
+                email_from = os.getenv("EMAIL_FROM", "bestiescraft1434@gmail.com")
 
-        return {"success": True, "message": f"OTP sent to your {'email' if email else 'phone'}"}
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = "Your Besties Craft OTP"
+                msg["From"]    = email_from
+                msg["To"]      = email
 
+                html_body = f"""
+                <html><body style="font-family:Arial,sans-serif;padding:20px;">
+                    <h2 style="color:#c2602a;">Besties Craft</h2>
+                    <p>Your OTP for login is:</p>
+                    <h1 style="color:#333;letter-spacing:8px;">{otp}</h1>
+                    <p>Valid for <strong>10 minutes</strong>.</p>
+                    <p style="color:#999;font-size:12px;">If you didn't request this, ignore this email.</p>
+                </body></html>
+                """
+                msg.attach(MIMEText(html_body, "html"))
+
+                with smtplib.SMTP(smtp_host, smtp_port) as server:
+                    server.starttls()
+                    server.login(smtp_user, smtp_pass)
+                    server.sendmail(email_from, email, msg.as_string())
+            except Exception as email_error:
+                print(f"Email sending failed: {email_error}")
+
+        return {"success": True, "message": "OTP sent", "identifier": identifier}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/auth/verify-otp")
 def verify_otp(data: dict):
@@ -475,12 +476,12 @@ def verify_otp(data: dict):
 
         otp_record = db.otps.find_one({"identifier": identifier})
         if not otp_record:
-            raise HTTPException(status_code=401, detail="OTP not found — please request a new one")
+            raise HTTPException(status_code=401, detail="OTP expired")
         if datetime.utcnow().timestamp() > otp_record.get("expiresAt", 0):
             db.otps.delete_one({"_id": otp_record["_id"]})
-            raise HTTPException(status_code=401, detail="OTP has expired — please request a new one")
+            raise HTTPException(status_code=401, detail="OTP expired")
         if str(otp_record["otp"]) != otp_entered:
-            raise HTTPException(status_code=401, detail="Incorrect OTP — please try again")
+            raise HTTPException(status_code=401, detail="Invalid OTP")
 
         db.otps.delete_one({"_id": otp_record["_id"]})
 
@@ -496,16 +497,13 @@ def verify_otp(data: dict):
         )
         user    = db.users.find_one({"$or": [{"email": email}, {"phone": phone}]})
         user_id = str(user["_id"]) if user else None
-        token   = __import__('hashlib').sha256(
-            f"{user_id}{identifier}{datetime.utcnow()}".encode()
-        ).hexdigest()
+        token   = __import__('hashlib').sha256(f"{user_id}{identifier}{datetime.utcnow()}".encode()).hexdigest()
 
         return {"success": True, "token": token, "user": {"id": user_id, "email": email, "phone": phone}}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/auth/admin-login")
 def admin_login(credentials: dict):
@@ -517,9 +515,7 @@ def admin_login(credentials: dict):
         admin_password = os.getenv("ADMIN_PASSWORD", "Bhola143")
         if password == admin_password:
             admin_email = os.getenv("ADMIN_EMAIL", "bestiescraft1434@gmail.com")
-            token = __import__('hashlib').sha256(
-                f"{admin_email}{datetime.utcnow()}".encode()
-            ).hexdigest()
+            token = __import__('hashlib').sha256(f"{admin_email}{datetime.utcnow()}".encode()).hexdigest()
             return {"success": True, "token": token, "email": admin_email}
         else:
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -568,11 +564,7 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
         order_id = str(result.inserted_id)
         order_doc["_id"] = order_id
 
-        razorpay_order = {
-            "id":       f"order_{order_id}",
-            "amount":   int(order_req.total_amount * 100),
-            "currency": "INR"
-        }
+        razorpay_order = {"id": f"order_{order_id}", "amount": int(order_req.total_amount * 100), "currency": "INR"}
 
         try:
             import razorpay as rz
@@ -580,24 +572,15 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
             rz_secret = os.getenv("RAZORPAY_KEY_SECRET")
             if rz_key and rz_secret:
                 rz_client     = rz.Client(auth=(rz_key, rz_secret))
-                razorpay_order = rz_client.order.create({
-                    "amount":   int(order_req.total_amount * 100),
-                    "currency": "INR",
-                    "receipt":  order_id
-                })
+                razorpay_order = rz_client.order.create({"amount": int(order_req.total_amount * 100), "currency": "INR", "receipt": order_id})
         except Exception as rz_err:
             print(f"Razorpay order creation failed: {rz_err}")
 
-        return {
-            "success":        True,
-            "order":          {"id": order_id, **order_doc},
-            "razorpay_order": razorpay_order
-        }
+        return {"success": True, "order": {"id": order_id, **order_doc}, "razorpay_order": razorpay_order}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/orders/verify-payment")
 def verify_payment(payment_data: dict):
@@ -610,7 +593,6 @@ def verify_payment(payment_data: dict):
         return {"success": True, "message": "Payment verified"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/api/orders/user/{user_id}")
 def get_user_orders(user_id: str, authorization: str = Header(None)):
@@ -643,7 +625,6 @@ def get_all_orders(admin_token: str = Header(None)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.put("/api/admin/orders/{order_id}")
 def update_order_status(order_id: str, status_data: dict, admin_token: str = Header(None)):
@@ -680,20 +661,18 @@ def get_dashboard_stats(admin_token: str = Header(None)):
         ]))
         total_revenue = revenue_data[0]["total"] if revenue_data else 0
 
-        order_status  = list(db.orders.aggregate([
-            {"$group": {"_id": "$order_status", "count": {"$sum": 1}}}
-        ]))
+        order_status  = list(db.orders.aggregate([{"$group": {"_id": "$order_status", "count": {"$sum": 1}}}]))
         custom_orders = db.orders.count_documents({"has_customisation": True})
 
         return {
             "success": True,
             "stats": {
-                "total_products":  total_products,
-                "total_orders":    total_orders,
-                "total_customers": total_customers,
-                "total_revenue":   total_revenue,
-                "custom_orders":   custom_orders,
-                "order_status":    {item["_id"]: item["count"] for item in order_status}
+                "total_products":   total_products,
+                "total_orders":     total_orders,
+                "total_customers":  total_customers,
+                "total_revenue":    total_revenue,
+                "custom_orders":    custom_orders,
+                "order_status":     {item["_id"]: item["count"] for item in order_status}
             }
         }
     except HTTPException:
