@@ -6,11 +6,10 @@ from pymongo import MongoClient
 from bson import ObjectId
 from datetime import datetime
 import os
-import random
 import cloudinary
 import cloudinary.uploader
 import firebase_admin
-from firebase_admin import auth as fb_auth, credentials as fb_creds
+from firebase_admin import auth as fb_auth
 
 # ============= SETUP =============
 
@@ -26,7 +25,7 @@ cloudinary.config(
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
 
-# ── Firebase Admin SDK — initialise once at startup ──
+# Firebase Admin SDK
 _FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 if _FIREBASE_PROJECT_ID and not firebase_admin._apps:
     try:
@@ -47,10 +46,6 @@ app.add_middleware(
 # ============= HELPERS =============
 
 def normalise_categories(raw) -> List[str]:
-    """
-    Always return a clean list of category strings.
-    Handles: str, List[str], comma-separated str, None.
-    """
     if raw is None:
         return ["general"]
     if isinstance(raw, list):
@@ -67,12 +62,9 @@ def normalise_categories(raw) -> List[str]:
     return ["general"]
 
 def fix_product_out(p: dict) -> dict:
-    """Ensure every product going to the client has categories as a list."""
     p["_id"] = str(p["_id"])
-    # normalise category → categories (list)
     raw = p.get("categories") or p.get("category")
     p["categories"] = normalise_categories(raw)
-    # keep legacy "category" as first item so old frontend code doesn't break
     p["category"] = p["categories"][0] if p["categories"] else "general"
     p["in_stock"] = p.get("stock", 0) > 0
     return p
@@ -101,9 +93,8 @@ class Product(BaseModel):
     description: str
     base_price: float
     images: List[ProductImage]
-    # ── categories: accepts either a list OR a single string from old admin forms
     categories: Optional[Union[List[str], str]] = None
-    category:   Optional[Union[List[str], str]] = None   # legacy field — accepted but normalised
+    category:   Optional[Union[List[str], str]] = None
     stock: int = 0
     colors: List[str] = []
     variants: List[ProductVariant] = []
@@ -115,11 +106,9 @@ class Product(BaseModel):
 
     @validator("categories", pre=True, always=True)
     def normalise_cats(cls, v, values):
-        # merge both fields, prefer categories
         raw = v if v is not None else values.get("category")
         return normalise_categories(raw)
 
-# ─── CartItem carries colour + customisation ───
 class CartItem(BaseModel):
     product_id: str
     product_name: Optional[str] = None
@@ -153,20 +142,15 @@ class CreateOrderRequest(BaseModel):
     total_amount: float
     shipping_details: Optional[ShippingDetails] = None
 
-class Order(BaseModel):
-    user_id: str
-    items: List[CartItem]
-    shipping_address: dict
-    billing_address: Optional[dict] = None
-    payment_method: str = "razorpay"
-
 # ============= BASIC ENDPOINTS =============
 
-@app.get("/")
+# ✅ HEAD method added so UptimeRobot monitoring shows green
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"message": "Besties Craft Backend API", "version": "2.0", "docs": "/docs"}
 
-@app.get("/health")
+# ✅ HEAD method added on health too
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     try:
         db.admin.command('ping')
@@ -179,37 +163,26 @@ def health_check():
 
 @app.post("/api/admin/migrate-categories")
 def migrate_categories(admin_token: str = Header(None)):
-    """
-    Run once after deploy.
-    Converts every product whose 'category' is a plain string
-    into a 'categories' list, and keeps both fields in sync.
-    """
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
         products = list(db.products.find())
         updated = 0
         for p in products:
             raw_cats = p.get("categories")
             raw_cat  = p.get("category")
-
-            # Already a proper list — just make sure both fields exist
             if isinstance(raw_cats, list) and len(raw_cats) > 0:
-                first = raw_cats[0]
                 db.products.update_one(
                     {"_id": p["_id"]},
-                    {"$set": {"categories": raw_cats, "category": first}}
+                    {"$set": {"categories": raw_cats, "category": raw_cats[0]}}
                 )
             else:
-                # Convert old string category to list
                 cats = normalise_categories(raw_cat or raw_cats)
                 db.products.update_one(
                     {"_id": p["_id"]},
                     {"$set": {"categories": cats, "category": cats[0]}}
                 )
             updated += 1
-
         return {"success": True, "message": f"Migrated {updated} products"}
     except HTTPException:
         raise
@@ -225,11 +198,9 @@ async def upload_image(file: UploadFile = File(...)):
         file_extension = file.filename.split(".")[-1].lower()
         if file_extension not in allowed_extensions:
             raise HTTPException(status_code=400, detail="File type not allowed")
-
         file_content = await file.read()
         if len(file_content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File too large (max 10MB)")
-
         result = cloudinary.uploader.upload(
             file_content,
             folder="besties-craft-products",
@@ -261,18 +232,13 @@ def get_admin_products(admin_token: str = Header(None)):
 def get_products(category: Optional[str] = None, brand: Optional[str] = None, sort: str = "newest"):
     try:
         query = {}
-
         if category:
-            # Match products where the requested category appears in the categories LIST
-            # Also fall back to matching the legacy 'category' string field
             query["$or"] = [
                 {"categories": {"$in": [category]}},
                 {"category": category}
             ]
-
         if brand:
             query["brand"] = brand
-
         sort_map = {
             "newest":     [("createdAt", -1)],
             "price_low":  [("base_price", 1)],
@@ -293,14 +259,11 @@ def get_product(product_id: str):
         product = db.products.find_one({"_id": ObjectId(product_id)})
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
-
         fix_product_out(product)
-
         reviews = list(db.reviews.find({"product_id": product_id}).sort("createdAt", -1).limit(20))
         for r in reviews:
             r["_id"] = str(r["_id"])
         product["reviews"] = reviews
-
         return {"success": True, "product": product}
     except HTTPException:
         raise
@@ -312,13 +275,10 @@ def create_product(product: Product, admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
         product_dict = product.dict()
-        # Normalise categories
         cats = normalise_categories(product_dict.get("categories") or product_dict.get("category"))
         product_dict["categories"] = cats
-        product_dict["category"]   = cats[0]   # keep legacy field as first category
-
+        product_dict["category"]   = cats[0]
         product_dict["createdAt"] = datetime.utcnow()
         product_dict["updatedAt"] = datetime.utcnow()
         result = db.products.insert_one(product_dict)
@@ -334,13 +294,10 @@ def update_product(product_id: str, product: Product, admin_token: str = Header(
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
         product_dict = product.dict()
-        # Normalise categories
         cats = normalise_categories(product_dict.get("categories") or product_dict.get("category"))
         product_dict["categories"] = cats
         product_dict["category"]   = cats[0]
-
         product_dict["updatedAt"] = datetime.utcnow()
         result = db.products.update_one({"_id": ObjectId(product_id)}, {"$set": product_dict})
         if result.matched_count == 0:
@@ -372,7 +329,6 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
         review = {
             "product_id":    product_id,
             "user_id":       review_data.get("user_id"),
@@ -385,7 +341,6 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
         }
         result = db.reviews.insert_one(review)
         review["_id"] = str(result.inserted_id)
-
         avg_data = list(db.reviews.aggregate([
             {"$match": {"product_id": product_id}},
             {"$group": {"_id": None, "avg": {"$avg": "$rating"}, "count": {"$sum": 1}}}
@@ -415,18 +370,10 @@ def get_reviews(product_id: str):
 
 @app.post("/api/auth/verify-firebase-token")
 def verify_firebase_token(data: dict):
-    """
-    Called by the frontend after Firebase signs the user in.
-    Verifies the Firebase ID token, then upserts the user in our MongoDB
-    so order history etc. works correctly.
-    Returns our own lightweight user record.
-    """
     try:
         token = data.get("token")
         if not token:
             raise HTTPException(status_code=400, detail="Token required")
-
-        # ── Verify with Firebase Admin SDK (initialised at startup) ──────
         try:
             decoded = fb_auth.verify_id_token(token)
             uid     = decoded["uid"]
@@ -434,31 +381,19 @@ def verify_firebase_token(data: dict):
         except Exception as verify_err:
             print(f"Firebase token verification failed: {verify_err}")
             raise HTTPException(status_code=401, detail="Invalid or expired Firebase token")
-
-        # ── Upsert user in MongoDB ──────────────────────────────────────
         user_data = {
             "firebase_uid": uid,
             "email":        email,
             "lastLogin":    datetime.utcnow(),
         }
-        db.users.update_one(
-            {"firebase_uid": uid},
-            {"$set": user_data},
-            upsert=True
-        )
+        db.users.update_one({"firebase_uid": uid}, {"$set": user_data}, upsert=True)
         user    = db.users.find_one({"firebase_uid": uid})
         user_id = str(user["_id"]) if user else uid
-
-        return {
-            "success": True,
-            "user": {"id": user_id, "email": email, "firebase_uid": uid}
-        }
-
+        return {"success": True, "user": {"id": user_id, "email": email, "firebase_uid": uid}}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/auth/admin-login")
 def admin_login(credentials: dict):
@@ -466,7 +401,6 @@ def admin_login(credentials: dict):
         password = credentials.get("password")
         if not password:
             raise HTTPException(status_code=400, detail="Password required")
-
         admin_password = os.getenv("ADMIN_PASSWORD", "Bhola143")
         if password == admin_password:
             admin_email = os.getenv("ADMIN_EMAIL", "bestiescraft1434@gmail.com")
@@ -486,7 +420,6 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
         items = []
         for item in order_req.items:
             item_dict = item.dict()
@@ -499,9 +432,7 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
                 pass
             item_dict["customisation"] = (item.customisation or "").strip() or None
             items.append(item_dict)
-
         shipping = order_req.shipping_details.dict() if order_req.shipping_details else {}
-
         order_doc = {
             "user_id":           order_req.user_id,
             "items":             items,
@@ -514,23 +445,19 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
             "user_phone":        shipping.get("phone", ""),
             "has_customisation": any(i.get("customisation") for i in items),
         }
-
         result   = db.orders.insert_one(order_doc)
         order_id = str(result.inserted_id)
         order_doc["_id"] = order_id
-
         razorpay_order = {"id": f"order_{order_id}", "amount": int(order_req.total_amount * 100), "currency": "INR"}
-
         try:
             import razorpay as rz
             rz_key    = os.getenv("RAZORPAY_KEY_ID")
             rz_secret = os.getenv("RAZORPAY_KEY_SECRET")
             if rz_key and rz_secret:
-                rz_client     = rz.Client(auth=(rz_key, rz_secret))
+                rz_client      = rz.Client(auth=(rz_key, rz_secret))
                 razorpay_order = rz_client.order.create({"amount": int(order_req.total_amount * 100), "currency": "INR", "receipt": order_id})
         except Exception as rz_err:
             print(f"Razorpay order creation failed: {rz_err}")
-
         return {"success": True, "order": {"id": order_id, **order_doc}, "razorpay_order": razorpay_order}
     except HTTPException:
         raise
@@ -605,20 +532,16 @@ def get_dashboard_stats(admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
         total_products  = db.products.count_documents({})
         total_orders    = db.orders.count_documents({})
         total_customers = db.users.count_documents({})
-
         revenue_data = list(db.orders.aggregate([
             {"$match": {"payment_status": "paid"}},
             {"$group": {"_id": None, "total": {"$sum": "$total_amount"}}}
         ]))
         total_revenue = revenue_data[0]["total"] if revenue_data else 0
-
         order_status  = list(db.orders.aggregate([{"$group": {"_id": "$order_status", "count": {"$sum": 1}}}]))
         custom_orders = db.orders.count_documents({"has_customisation": True})
-
         return {
             "success": True,
             "stats": {
