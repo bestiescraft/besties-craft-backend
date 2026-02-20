@@ -6,7 +6,6 @@ python-jose[cryptography]
 pydantic
 pymongo
 requests
-twilio
 slowapi
 python-multipart
 aiofiles
