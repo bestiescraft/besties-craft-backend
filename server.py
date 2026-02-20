@@ -35,7 +35,6 @@ app.add_middleware(
 )
 
 # ============= CATEGORY HELPERS =============
-# CHANGE 2: Fixes multi-category product bug + category page showing empty
 
 VALID_CATEGORIES = {
     'bracelets', 'handmade-flowers', 'keychains',
@@ -43,7 +42,6 @@ VALID_CATEGORIES = {
 }
 
 def normalize_category_field(raw):
-    """Always returns a clean list of valid category slugs."""
     if not raw:
         return []
     cats = raw if isinstance(raw, list) else [raw]
@@ -54,11 +52,9 @@ def normalize_category_field(raw):
     ]
 
 def prep_product(p):
-    """Shared serialiser — call before returning any product to frontend."""
     p["_id"]        = str(p["_id"])
     p["in_stock"]   = p.get("stock", 0) > 0
     p["categories"] = normalize_category_field(p.get("category"))
-    # Keep single string for any frontend code that still reads product.category
     p["category"]   = p["categories"][0] if p["categories"] else ""
     return p
 
@@ -86,7 +82,6 @@ class Product(BaseModel):
     description: str
     base_price: float
     images: List[ProductImage]
-    # CHANGE 3: Accept both single string AND list from admin panel
     category: Optional[Union[str, List[str]]] = "general"
     stock: int = 0
     colors: List[str] = []
@@ -97,7 +92,6 @@ class Product(BaseModel):
     brand: Optional[str] = None
     warranty: Optional[str] = None
 
-# ─── CartItem now carries colour + customisation ───
 class CartItem(BaseModel):
     product_id: str
     product_name: Optional[str] = None
@@ -172,7 +166,6 @@ async def upload_image(file: UploadFile = File(...)):
             folder="besties-craft-products",
             resource_type="image"
         )
-
         return {"success": True, "image_url": result["secure_url"], "filename": result["public_id"]}
     except HTTPException:
         raise
@@ -202,7 +195,6 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
     try:
         query = {}
         if category:
-            # CHANGE 4: $in works whether DB stores string OR array
             query["category"] = {"$in": [category]}
         if brand:
             query["brand"] = brand
@@ -214,7 +206,6 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
             "rating":     [("rating", -1)],
             "popular":    [("reviews_count", -1)]
         }
-        # CHANGE 5: use prep_product instead of manual serialization
         products = list(db.products.find(query).sort(sort_map.get(sort, [("createdAt", -1)])))
         products = [prep_product(p) for p in products]
         return {"success": True, "count": len(products), "products": products}
@@ -228,7 +219,6 @@ def get_product(product_id: str):
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
 
-        # CHANGE 6: use prep_product instead of manual serialization
         product = prep_product(product)
 
         reviews = list(db.reviews.find({"product_id": product_id}).sort("createdAt", -1).limit(20))
@@ -316,7 +306,6 @@ def add_review(product_id: str, review_data: dict, authorization: str = Header(N
                 {"_id": ObjectId(product_id)},
                 {"$set": {"rating": round(avg_data[0]["avg"], 2), "reviews_count": avg_data[0]["count"]}}
             )
-
         return {"success": True, "review": review}
     except HTTPException:
         raise
@@ -335,17 +324,122 @@ def get_reviews(product_id: str):
 
 # ============= AUTH =============
 
+def _send_email_otp(to_email: str, otp: str):
+    """
+    Send OTP via Brevo SMTP.
+    Raises HTTPException with clear message if anything is wrong.
+    """
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    smtp_host  = os.getenv("SMTP_HOST",  "smtp-relay.brevo.com")
+    smtp_port  = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user  = os.getenv("SMTP_USER")   # your Brevo login email e.g. yourname@gmail.com
+    smtp_pass  = os.getenv("SMTP_PASS")   # Brevo SMTP password (NOT your login password)
+    email_from = os.getenv("EMAIL_FROM",  "bestiescraft1434@gmail.com")
+
+    # ── Fail clearly if credentials missing ──────────────────────────
+    if not smtp_user:
+        raise HTTPException(status_code=500,
+            detail="SMTP_USER not set in Render env vars. Set it to your Brevo login email.")
+    if not smtp_pass:
+        raise HTTPException(status_code=500,
+            detail="SMTP_PASS not set in Render env vars. Set it to your Brevo SMTP password.")
+
+    msg            = MIMEMultipart("alternative")
+    msg["Subject"] = "Your Besties Craft OTP"
+    msg["From"]    = f"Besties Craft <{email_from}>"
+    msg["To"]      = to_email
+
+    html_body = f"""
+    <html>
+    <body style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#faf7f2;">
+      <div style="text-align:center;margin-bottom:24px;">
+        <h2 style="font-family:Georgia,serif;color:#2c1810;margin:0;">
+          Besties <span style="color:#c2602a;font-style:italic;">Craft</span>
+        </h2>
+        <p style="color:#9a8070;font-size:13px;margin:4px 0 0;">Handcrafted in India</p>
+      </div>
+      <div style="background:#fff;border-radius:16px;padding:32px;border:1px solid #e8dfd0;text-align:center;">
+        <p style="color:#4a3728;margin:0 0 20px;">Your login OTP is:</p>
+        <div style="font-size:42px;font-weight:700;letter-spacing:16px;color:#2c1810;font-family:Georgia,serif;">
+          {otp}
+        </div>
+        <p style="color:#9a8070;font-size:13px;margin:20px 0 0;">
+          Valid for <strong>10 minutes</strong>. Do not share this with anyone.
+        </p>
+      </div>
+      <p style="color:#ccc;font-size:11px;text-align:center;margin-top:20px;">
+        If you didn't request this, you can safely ignore this email.
+      </p>
+    </body>
+    </html>
+    """
+    msg.attach(MIMEText(html_body, "html"))
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(email_from, to_email, msg.as_string())
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(status_code=500,
+            detail="SMTP authentication failed. Check SMTP_USER and SMTP_PASS in Render env vars.")
+    except smtplib.SMTPException as e:
+        raise HTTPException(status_code=500, detail=f"SMTP error: {str(e)}")
+
+
+def _send_phone_otp(to_phone: str, otp: str):
+    """
+    Send OTP via Twilio SMS.
+    Uses TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER from Render env vars.
+    Raises HTTPException with clear message if anything is wrong.
+    """
+    account_sid   = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token    = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number   = os.getenv("TWILIO_PHONE_NUMBER")
+
+    if not account_sid or not auth_token or not from_number:
+        raise HTTPException(status_code=500,
+            detail="Twilio env vars missing. Need TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.")
+
+    # Format Indian number: 9876543210 → +919876543210
+    phone_digits = to_phone.strip().replace(" ", "").replace("-", "")
+    if not phone_digits.startswith("+"):
+        phone_digits = "+91" + phone_digits.lstrip("0")
+
+    try:
+        from twilio.rest import Client as TwilioClient
+        twilio_client = TwilioClient(account_sid, auth_token)
+        message = twilio_client.messages.create(
+            body=f"Your Besties Craft OTP is: {otp}\nValid for 10 minutes. Do not share this.",
+            from_=from_number,
+            to=phone_digits
+        )
+        print(f"[Twilio] SMS sent to {phone_digits}, SID: {message.sid}")
+    except ImportError:
+        raise HTTPException(status_code=500,
+            detail="twilio package not installed. Add 'twilio' to requirements.txt")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Twilio SMS failed: {str(e)}")
+
+
 @app.post("/api/auth/send-otp")
 def send_otp(data: dict):
     try:
         email = data.get("email")
         phone = data.get("phone")
+
         if not email and not phone:
             raise HTTPException(status_code=400, detail="Email or phone required")
 
         identifier = email if email else phone
         otp = ''.join([str(random.randint(0, 9)) for _ in range(6)])
 
+        # Store OTP in DB
         db.otps.delete_many({"identifier": identifier})
         db.otps.insert_one({
             "identifier": identifier,
@@ -355,77 +449,18 @@ def send_otp(data: dict):
         })
 
         if email:
-            # CHANGE 7: raise real error instead of silently swallowing it
-            smtp_host  = os.getenv("SMTP_HOST", "smtp-relay.brevo.com")
-            smtp_port  = int(os.getenv("SMTP_PORT", "587"))
-            smtp_user  = os.getenv("SMTP_USER")
-            smtp_pass  = os.getenv("SMTP_PASS")
-            email_from = os.getenv("EMAIL_FROM", "bestiescraft1434@gmail.com")
-
-            if not smtp_user:
-                raise HTTPException(status_code=500, detail="SMTP_USER env var not set in Render dashboard")
-            if not smtp_pass:
-                raise HTTPException(status_code=500, detail="SMTP_PASS env var not set in Render dashboard")
-
-            try:
-                import smtplib
-                from email.mime.text import MIMEText
-                from email.mime.multipart import MIMEMultipart
-
-                msg            = MIMEMultipart("alternative")
-                msg["Subject"] = "Your Besties Craft OTP"
-                msg["From"]    = f"Besties Craft <{email_from}>"
-                msg["To"]      = email
-
-                html_body = f"""
-                <html>
-                <body style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#faf7f2;">
-                  <div style="text-align:center;margin-bottom:24px;">
-                    <h2 style="font-family:Georgia,serif;color:#2c1810;margin:0;">
-                      Besties <span style="color:#c2602a;font-style:italic;">Craft</span>
-                    </h2>
-                    <p style="color:#9a8070;font-size:13px;margin:4px 0 0;">Handcrafted in India</p>
-                  </div>
-                  <div style="background:#fff;border-radius:16px;padding:32px;border:1px solid #e8dfd0;text-align:center;">
-                    <p style="color:#4a3728;margin:0 0 20px;">Your login OTP is:</p>
-                    <div style="font-size:40px;font-weight:700;letter-spacing:14px;color:#2c1810;font-family:Georgia,serif;">
-                      {otp}
-                    </div>
-                    <p style="color:#9a8070;font-size:13px;margin:20px 0 0;">
-                      Valid for <strong>10 minutes</strong>. Do not share this with anyone.
-                    </p>
-                  </div>
-                  <p style="color:#bbb;font-size:11px;text-align:center;margin-top:20px;">
-                    If you didn't request this, you can safely ignore this email.
-                  </p>
-                </body>
-                </html>
-                """
-                msg.attach(MIMEText(html_body, "html"))
-
-                with smtplib.SMTP(smtp_host, smtp_port) as server:
-                    server.ehlo()
-                    server.starttls()
-                    server.ehlo()
-                    server.login(smtp_user, smtp_pass)
-                    server.sendmail(email_from, email, msg.as_string())
-
-            except HTTPException:
-                raise
-            except Exception as email_error:
-                # Now surfaces as real error — visible in Render logs AND to frontend
-                raise HTTPException(status_code=500, detail=f"Email sending failed: {str(email_error)}")
+            _send_email_otp(email, otp)   # raises HTTPException on failure
 
         if phone:
-            # Phone OTP is stored in DB — SMS delivery handled by Firebase on frontend
-            # If you are NOT using Firebase frontend yet, log the OTP for testing:
-            print(f"[DEV] Phone OTP for {phone}: {otp}")
+            _send_phone_otp(phone, otp)   # raises HTTPException on failure
 
-        return {"success": True, "message": "OTP sent", "identifier": identifier}
+        return {"success": True, "message": f"OTP sent to your {'email' if email else 'phone'}"}
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/auth/verify-otp")
 def verify_otp(data: dict):
@@ -450,8 +485,8 @@ def verify_otp(data: dict):
         db.otps.delete_one({"_id": otp_record["_id"]})
 
         user_data = {
-            "email": email if email else None,
-            "phone": phone if phone else None,
+            "email":     email if email else None,
+            "phone":     phone if phone else None,
             "lastLogin": datetime.utcnow()
         }
         db.users.update_one(
@@ -461,13 +496,16 @@ def verify_otp(data: dict):
         )
         user    = db.users.find_one({"$or": [{"email": email}, {"phone": phone}]})
         user_id = str(user["_id"]) if user else None
-        token   = __import__('hashlib').sha256(f"{user_id}{identifier}{datetime.utcnow()}".encode()).hexdigest()
+        token   = __import__('hashlib').sha256(
+            f"{user_id}{identifier}{datetime.utcnow()}".encode()
+        ).hexdigest()
 
         return {"success": True, "token": token, "user": {"id": user_id, "email": email, "phone": phone}}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/auth/admin-login")
 def admin_login(credentials: dict):
@@ -479,7 +517,9 @@ def admin_login(credentials: dict):
         admin_password = os.getenv("ADMIN_PASSWORD", "Bhola143")
         if password == admin_password:
             admin_email = os.getenv("ADMIN_EMAIL", "bestiescraft1434@gmail.com")
-            token = __import__('hashlib').sha256(f"{admin_email}{datetime.utcnow()}".encode()).hexdigest()
+            token = __import__('hashlib').sha256(
+                f"{admin_email}{datetime.utcnow()}".encode()
+            ).hexdigest()
             return {"success": True, "token": token, "email": admin_email}
         else:
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -492,10 +532,6 @@ def admin_login(credentials: dict):
 
 @app.post("/api/orders/create")
 def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(None)):
-    """
-    Frontend checkout calls this. Each item may carry a customisation note.
-    The note is stored with the item so admin can see it.
-    """
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -543,13 +579,12 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
             rz_key    = os.getenv("RAZORPAY_KEY_ID")
             rz_secret = os.getenv("RAZORPAY_KEY_SECRET")
             if rz_key and rz_secret:
-                rz_client = rz.Client(auth=(rz_key, rz_secret))
-                rz_order  = rz_client.order.create({
+                rz_client     = rz.Client(auth=(rz_key, rz_secret))
+                razorpay_order = rz_client.order.create({
                     "amount":   int(order_req.total_amount * 100),
                     "currency": "INR",
                     "receipt":  order_id
                 })
-                razorpay_order = rz_order
         except Exception as rz_err:
             print(f"Razorpay order creation failed: {rz_err}")
 
@@ -563,6 +598,7 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/api/orders/verify-payment")
 def verify_payment(payment_data: dict):
     try:
@@ -574,6 +610,7 @@ def verify_payment(payment_data: dict):
         return {"success": True, "message": "Payment verified"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/orders/user/{user_id}")
 def get_user_orders(user_id: str, authorization: str = Header(None)):
@@ -606,6 +643,7 @@ def get_all_orders(admin_token: str = Header(None)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.put("/api/admin/orders/{order_id}")
 def update_order_status(order_id: str, status_data: dict, admin_token: str = Header(None)):
