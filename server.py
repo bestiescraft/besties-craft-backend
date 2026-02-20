@@ -9,6 +9,8 @@ import os
 import random
 import cloudinary
 import cloudinary.uploader
+import firebase_admin
+from firebase_admin import auth as fb_auth, credentials as fb_creds
 
 # ============= SETUP =============
 
@@ -23,6 +25,14 @@ cloudinary.config(
     api_key=os.getenv("CLOUDINARY_API_KEY"),
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
+
+# ── Firebase Admin SDK — initialise once at startup ──
+_FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
+if _FIREBASE_PROJECT_ID and not firebase_admin._apps:
+    try:
+        firebase_admin.initialize_app(options={"projectId": _FIREBASE_PROJECT_ID})
+    except Exception as _fe:
+        print(f"Firebase Admin init warning: {_fe}")
 
 app = FastAPI(title="Besties Craft API", version="2.0")
 
@@ -403,107 +413,52 @@ def get_reviews(product_id: str):
 
 # ============= AUTH =============
 
-@app.post("/api/auth/send-otp")
-def send_otp(data: dict):
+@app.post("/api/auth/verify-firebase-token")
+def verify_firebase_token(data: dict):
+    """
+    Called by the frontend after Firebase signs the user in.
+    Verifies the Firebase ID token, then upserts the user in our MongoDB
+    so order history etc. works correctly.
+    Returns our own lightweight user record.
+    """
     try:
-        email = data.get("email")
-        phone = data.get("phone")
-        if not email and not phone:
-            raise HTTPException(status_code=400, detail="Email or phone required")
+        token = data.get("token")
+        if not token:
+            raise HTTPException(status_code=400, detail="Token required")
 
-        identifier = email if email else phone
-        otp = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+        # ── Verify with Firebase Admin SDK (initialised at startup) ──────
+        try:
+            decoded = fb_auth.verify_id_token(token)
+            uid     = decoded["uid"]
+            email   = decoded.get("email", "")
+        except Exception as verify_err:
+            print(f"Firebase token verification failed: {verify_err}")
+            raise HTTPException(status_code=401, detail="Invalid or expired Firebase token")
 
-        db.otps.delete_many({"identifier": identifier})
-        db.otps.insert_one({
-            "identifier": identifier,
-            "otp":        otp,
-            "createdAt":  datetime.utcnow(),
-            "expiresAt":  datetime.utcnow().timestamp() + 600
-        })
-
-        if email:
-            try:
-                import smtplib
-                from email.mime.text import MIMEText
-                from email.mime.multipart import MIMEMultipart
-
-                smtp_host  = os.getenv("SMTP_HOST", "smtp-relay.brevo.com")
-                smtp_port  = int(os.getenv("SMTP_PORT", 587))
-                smtp_user  = os.getenv("SMTP_USER")
-                smtp_pass  = os.getenv("SMTP_PASS")
-                email_from = os.getenv("EMAIL_FROM", "bestiescraft1434@gmail.com")
-
-                msg = MIMEMultipart("alternative")
-                msg["Subject"] = "Your Besties Craft OTP"
-                msg["From"]    = email_from
-                msg["To"]      = email
-
-                html_body = f"""
-                <html><body style="font-family:Arial,sans-serif;padding:20px;">
-                    <h2 style="color:#c2602a;">Besties Craft</h2>
-                    <p>Your OTP for login is:</p>
-                    <h1 style="color:#333;letter-spacing:8px;">{otp}</h1>
-                    <p>Valid for <strong>10 minutes</strong>.</p>
-                    <p style="color:#999;font-size:12px;">If you didn't request this, ignore this email.</p>
-                </body></html>
-                """
-                msg.attach(MIMEText(html_body, "html"))
-
-                with smtplib.SMTP(smtp_host, smtp_port) as server:
-                    server.starttls()
-                    server.login(smtp_user, smtp_pass)
-                    server.sendmail(email_from, email, msg.as_string())
-            except Exception as email_error:
-                print(f"Email sending failed: {email_error}")
-
-        return {"success": True, "message": "OTP sent", "identifier": identifier}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/auth/verify-otp")
-def verify_otp(data: dict):
-    try:
-        email       = data.get("email")
-        phone       = data.get("phone")
-        otp_entered = str(data.get("otp", "")).strip()
-        identifier  = email if email else phone
-
-        if not identifier or not otp_entered:
-            raise HTTPException(status_code=400, detail="Missing data")
-
-        otp_record = db.otps.find_one({"identifier": identifier})
-        if not otp_record:
-            raise HTTPException(status_code=401, detail="OTP expired")
-        if datetime.utcnow().timestamp() > otp_record.get("expiresAt", 0):
-            db.otps.delete_one({"_id": otp_record["_id"]})
-            raise HTTPException(status_code=401, detail="OTP expired")
-        if str(otp_record["otp"]) != otp_entered:
-            raise HTTPException(status_code=401, detail="Invalid OTP")
-
-        db.otps.delete_one({"_id": otp_record["_id"]})
-
+        # ── Upsert user in MongoDB ──────────────────────────────────────
         user_data = {
-            "email":     email if email else None,
-            "phone":     phone if phone else None,
-            "lastLogin": datetime.utcnow()
+            "firebase_uid": uid,
+            "email":        email,
+            "lastLogin":    datetime.utcnow(),
         }
         db.users.update_one(
-            {"$or": [{"email": email}, {"phone": phone}]},
+            {"firebase_uid": uid},
             {"$set": user_data},
             upsert=True
         )
-        user    = db.users.find_one({"$or": [{"email": email}, {"phone": phone}]})
-        user_id = str(user["_id"]) if user else None
-        token   = __import__('hashlib').sha256(f"{user_id}{identifier}{datetime.utcnow()}".encode()).hexdigest()
+        user    = db.users.find_one({"firebase_uid": uid})
+        user_id = str(user["_id"]) if user else uid
 
-        return {"success": True, "token": token, "user": {"id": user_id, "email": email, "phone": phone}}
+        return {
+            "success": True,
+            "user": {"id": user_id, "email": email, "firebase_uid": uid}
+        }
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/auth/admin-login")
 def admin_login(credentials: dict):
