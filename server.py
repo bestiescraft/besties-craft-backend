@@ -4,8 +4,12 @@ from pydantic import BaseModel, validator
 from typing import List, Optional, Union
 from pymongo import MongoClient
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
+import random
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import cloudinary
 import cloudinary.uploader
 import firebase_admin
@@ -32,6 +36,10 @@ if _FIREBASE_PROJECT_ID and not firebase_admin._apps:
         firebase_admin.initialize_app(options={"projectId": _FIREBASE_PROJECT_ID})
     except Exception as _fe:
         print(f"Firebase Admin init warning: {_fe}")
+
+# Gmail config (set these in Render environment variables)
+GMAIL_USER = os.getenv("GMAIL_USER", "")          # e.g. bestiescraft1434@gmail.com
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")  # 16-char app password
 
 app = FastAPI(title="Besties Craft API", version="2.0")
 
@@ -68,6 +76,38 @@ def fix_product_out(p: dict) -> dict:
     p["category"] = p["categories"][0] if p["categories"] else "general"
     p["in_stock"] = p.get("stock", 0) > 0
     return p
+
+def send_otp_email(to_email: str, otp: str):
+    """Send OTP email via Gmail SMTP."""
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        raise Exception("Gmail credentials not configured in environment variables")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "Your Besties Craft Login Code"
+    msg["From"]    = f"Besties Craft <{GMAIL_USER}>"
+    msg["To"]      = to_email
+
+    html = f"""
+    <div style="font-family:Georgia,serif;max-width:480px;margin:auto;padding:32px;background:#faf7f2;border-radius:16px;">
+      <div style="text-align:center;margin-bottom:24px;">
+        <div style="width:52px;height:52px;background:#1a1a1a;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;color:#d4a853;font-weight:bold;font-size:22px;">B</div>
+        <div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#888;margin-top:8px;">Artisan Collection</div>
+        <div style="font-size:22px;font-weight:bold;color:#1a1a1a;">Besties <span style="color:#c0783c;">Craft</span></div>
+      </div>
+      <div style="background:#fff;border-radius:12px;padding:32px;text-align:center;">
+        <h2 style="color:#1a1a1a;margin-bottom:8px;">Your Login Code</h2>
+        <p style="color:#888;font-size:14px;margin-bottom:24px;">Enter this code on the login page. It expires in 10 minutes.</p>
+        <div style="font-size:42px;font-weight:bold;letter-spacing:12px;color:#c0783c;background:#fdf9f0;padding:20px;border-radius:10px;margin-bottom:24px;">{otp}</div>
+        <p style="color:#aaa;font-size:12px;">If you didn't request this, you can safely ignore this email.</p>
+      </div>
+    </div>
+    """
+
+    msg.attach(MIMEText(html, "html"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_USER, to_email, msg.as_string())
 
 # ============= MODELS =============
 
@@ -142,14 +182,19 @@ class CreateOrderRequest(BaseModel):
     total_amount: float
     shipping_details: Optional[ShippingDetails] = None
 
+class SendOTPRequest(BaseModel):
+    email: str
+
+class VerifyOTPRequest(BaseModel):
+    email: str
+    otp: str
+
 # ============= BASIC ENDPOINTS =============
 
-# ✅ HEAD method added so UptimeRobot monitoring shows green
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"message": "Besties Craft Backend API", "version": "2.0", "docs": "/docs"}
 
-# ✅ HEAD method added on health too
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     try:
@@ -158,6 +203,87 @@ def health_check():
         return {"status": "ok", "database": "connected", "products_count": product_count}
     except:
         return {"status": "error", "database": "disconnected", "products_count": 0}
+
+# ============= EMAIL OTP AUTH =============
+
+@app.post("/api/auth/send-otp")
+def send_otp(req: SendOTPRequest):
+    try:
+        email = req.email.strip().lower()
+        if not email or "@" not in email:
+            raise HTTPException(status_code=400, detail="Invalid email address")
+
+        # Generate 6-digit OTP
+        otp = str(random.randint(100000, 999999))
+        expires_at = datetime.utcnow() + timedelta(minutes=10)
+
+        # Store OTP in MongoDB (upsert so only one OTP per email at a time)
+        db.otps.update_one(
+            {"email": email},
+            {"$set": {"otp": otp, "expires_at": expires_at, "verified": False}},
+            upsert=True
+        )
+
+        # Send email
+        send_otp_email(email, otp)
+
+        return {"success": True, "message": "OTP sent to your email"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Send OTP error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send OTP: {str(e)}")
+
+
+@app.post("/api/auth/verify-otp")
+def verify_otp(req: VerifyOTPRequest):
+    try:
+        email = req.email.strip().lower()
+        otp   = req.otp.strip()
+
+        record = db.otps.find_one({"email": email})
+
+        if not record:
+            raise HTTPException(status_code=400, detail="No OTP found for this email. Please request a new one.")
+
+        if record.get("verified"):
+            raise HTTPException(status_code=400, detail="OTP already used. Please request a new one.")
+
+        if datetime.utcnow() > record["expires_at"]:
+            db.otps.delete_one({"email": email})
+            raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
+
+        if record["otp"] != otp:
+            raise HTTPException(status_code=400, detail="Incorrect OTP. Please try again.")
+
+        # Mark as verified and clean up
+        db.otps.delete_one({"email": email})
+
+        # Upsert user in DB
+        user_data = {
+            "email":     email,
+            "lastLogin": datetime.utcnow(),
+        }
+        db.users.update_one({"email": email}, {"$set": user_data}, upsert=True)
+        user    = db.users.find_one({"email": email})
+        user_id = str(user["_id"])
+
+        return {
+            "success": True,
+            "message": "Login successful",
+            "user": {
+                "id":    user_id,
+                "email": email,
+                "name":  email.split("@")[0],
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Verify OTP error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============= ONE-TIME MIGRATION =============
 
