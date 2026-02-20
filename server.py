@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 from pymongo import MongoClient
 from bson import ObjectId
 from datetime import datetime
@@ -34,6 +34,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============= CATEGORY HELPERS =============
+# FIX: These two functions solve the multi-category bug.
+# Products saved with category as a list ["keychains","crafts"] were not
+# matching the old exact-string query — so category pages showed empty.
+
+VALID_CATEGORIES = {
+    'bracelets', 'handmade-flowers', 'keychains',
+    'hair-accessories', 'gifting-items', 'crafts'
+}
+
+def normalize_category_field(raw):
+    """
+    Always returns a clean LIST of valid category slugs.
+    Handles: None → [], "keychains" → ["keychains"],
+             ["keychains","crafts"] → ["keychains","crafts"],
+             "bags" (invalid) → []
+    """
+    if not raw:
+        return []
+    cats = raw if isinstance(raw, list) else [raw]
+    return [
+        c.strip().lower().replace(" ", "-")
+        for c in cats
+        if c.strip().lower().replace(" ", "-") in VALID_CATEGORIES
+    ]
+
+def prep_product(p):
+    """
+    Shared serialiser — call before returning any product to the frontend.
+    Always sends 'categories' (list) AND 'category' (first item string)
+    for backward compatibility with existing frontend code.
+    """
+    p["_id"]        = str(p["_id"])
+    p["in_stock"]   = p.get("stock", 0) > 0
+    p["categories"] = normalize_category_field(p.get("category"))
+    # Keep single string for any frontend code that still reads product.category
+    p["category"]   = p["categories"][0] if p["categories"] else ""
+    return p
+
 # ============= MODELS =============
 
 class ProductImage(BaseModel):
@@ -58,7 +97,8 @@ class Product(BaseModel):
     description: str
     base_price: float
     images: List[ProductImage]
-    category: str = "general"
+    # FIX: Accept both single string AND list from admin panel
+    category: Optional[Union[str, List[str]]] = "general"
     stock: int = 0
     colors: List[str] = []
     variants: List[ProductVariant] = []
@@ -75,7 +115,7 @@ class CartItem(BaseModel):
     quantity: int
     price: Optional[float] = None
     color: Optional[str] = None
-    customisation: Optional[str] = None   # ← NEW
+    customisation: Optional[str] = None
     selected_variants: Optional[dict] = None
 
 class OrderItem(BaseModel):
@@ -84,7 +124,7 @@ class OrderItem(BaseModel):
     quantity: int
     price: Optional[float] = None
     color: Optional[str] = None
-    customisation: Optional[str] = None   # ← NEW
+    customisation: Optional[str] = None
 
 class ShippingDetails(BaseModel):
     fullName: Optional[str] = None
@@ -159,7 +199,10 @@ def get_admin_products(admin_token: str = Header(None)):
             raise HTTPException(status_code=401, detail="Unauthorized")
         products = list(db.products.find())
         for p in products:
-            p["_id"] = str(p["_id"])
+            p["_id"]        = str(p["_id"])
+            # Normalize so admin panel also sees clean categories list
+            p["categories"] = normalize_category_field(p.get("category"))
+            p["category"]   = p["categories"][0] if p["categories"] else p.get("category", "")
         return {"success": True, "products": products}
     except HTTPException:
         raise
@@ -171,7 +214,9 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
     try:
         query = {}
         if category:
-            query["category"] = category
+            # FIX: $in matches whether DB stores "keychains" (string)
+            # OR ["keychains","crafts"] (array) — both work correctly now
+            query["category"] = {"$in": [category]}
         if brand:
             query["brand"] = brand
 
@@ -183,9 +228,7 @@ def get_products(category: Optional[str] = None, brand: Optional[str] = None, so
             "popular":    [("reviews_count", -1)]
         }
         products = list(db.products.find(query).sort(sort_map.get(sort, [("createdAt", -1)])))
-        for p in products:
-            p["_id"] = str(p["_id"])
-            p["in_stock"] = p.get("stock", 0) > 0
+        products = [prep_product(p) for p in products]
         return {"success": True, "count": len(products), "products": products}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -197,8 +240,7 @@ def get_product(product_id: str):
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
 
-        product["_id"] = str(product["_id"])
-        product["in_stock"] = product.get("stock", 0) > 0
+        product = prep_product(product)
 
         reviews = list(db.reviews.find({"product_id": product_id}).sort("createdAt", -1).limit(20))
         for r in reviews:
@@ -462,10 +504,8 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
             "order_status":    "pending",
             "payment_status":  "pending",
             "createdAt":       datetime.utcnow(),
-            # Denormalise for quick admin display
             "user_email":  shipping.get("email", ""),
             "user_phone":  shipping.get("phone", ""),
-            # Flag: does this order have ANY customisation?
             "has_customisation": any(i.get("customisation") for i in items),
         }
 
@@ -473,7 +513,6 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
         order_id = str(result.inserted_id)
         order_doc["_id"] = order_id
 
-        # Razorpay order object (or mock if key not set)
         razorpay_order = {
             "id":       f"order_{order_id}",
             "amount":   int(order_req.total_amount * 100),
@@ -593,7 +632,6 @@ def get_dashboard_stats(admin_token: str = Header(None)):
             {"$group": {"_id": "$order_status", "count": {"$sum": 1}}}
         ]))
 
-        # Count orders with customisation notes
         custom_orders = db.orders.count_documents({"has_customisation": True})
 
         return {
