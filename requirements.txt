@@ -12,3 +12,4 @@ aiofiles
 Pillow
 cloudinary
 firebase-admin
+razorpay
