@@ -13,3 +13,4 @@ Pillow
 cloudinary
 firebase-admin
 razorpay
+httpx
