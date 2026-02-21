@@ -8,6 +8,7 @@ from datetime import datetime
 import os
 import hmac
 import hashlib
+import httpx
 import cloudinary
 import cloudinary.uploader
 import firebase_admin
@@ -44,6 +45,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============= SHIPROCKET CONFIG =============
+
+SHIPROCKET_EMAIL    = os.getenv("SHIPROCKET_EMAIL", "")
+SHIPROCKET_PASSWORD = os.getenv("SHIPROCKET_PASSWORD", "")
+SHIPROCKET_API      = "https://apiv2.shiprocket.in/v1/external"
+
+# Cache token in memory (valid 24hrs)
+_sr_token_cache = {"token": None, "fetched_at": None}
+
+async def get_shiprocket_token() -> str:
+    import time
+    now = time.time()
+    if _sr_token_cache["token"] and _sr_token_cache["fetched_at"]:
+        if now - _sr_token_cache["fetched_at"] < 23 * 3600:
+            return _sr_token_cache["token"]
+    if not SHIPROCKET_EMAIL or not SHIPROCKET_PASSWORD:
+        raise HTTPException(status_code=500, detail="Shiprocket credentials not configured. Add SHIPROCKET_EMAIL and SHIPROCKET_PASSWORD to Render environment variables.")
+    async with httpx.AsyncClient() as c:
+        resp = await c.post(f"{SHIPROCKET_API}/auth/login", json={
+            "email":    SHIPROCKET_EMAIL,
+            "password": SHIPROCKET_PASSWORD
+        }, timeout=15)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Shiprocket login failed: {resp.text}")
+    token = resp.json().get("token")
+    _sr_token_cache["token"]      = token
+    _sr_token_cache["fetched_at"] = now
+    return token
+
 # ============= HELPERS =============
 
 def normalise_categories(raw) -> List[str]:
@@ -71,10 +101,8 @@ def fix_product_out(p: dict) -> dict:
     return p
 
 def fix_order_out(o: dict) -> dict:
-    """Normalize order document — fixes Invalid Date bug"""
     o["_id"] = str(o["_id"])
     o["id"]  = o["_id"]
-    # ✅ FIX: always expose created_at as a proper ISO string so frontend never gets "Invalid Date"
     raw_dt = o.get("createdAt") or o.get("created_at")
     if isinstance(raw_dt, datetime):
         o["created_at"] = raw_dt.isoformat()
@@ -85,7 +113,6 @@ def fix_order_out(o: dict) -> dict:
     return o
 
 def get_razorpay_client():
-    """Return (client, key_id, key_secret) or (None, None, None)"""
     try:
         import razorpay as rz
         rz_key    = os.getenv("RAZORPAY_KEY_ID", "")
@@ -412,21 +439,11 @@ def admin_login(credentials: dict):
 
 # ============= ORDERS =============
 
-# ── STEP 1: Create Razorpay order only — NO DB order saved yet ──
 @app.post("/api/orders/create")
 def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(None)):
-    """
-    ✅ NEW FLOW:
-    1. Create Razorpay order (payment intent)
-    2. Save to pending_payments collection temporarily
-    3. Real order in 'orders' collection is ONLY created after payment verified
-    → Failed/cancelled payments never appear in admin orders
-    """
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
-
-        # Enrich items with latest prices from DB
         items = []
         for item in order_req.items:
             item_dict = item.dict()
@@ -440,10 +457,9 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
             item_dict["customisation"] = (item.customisation or "").strip() or None
             items.append(item_dict)
 
-        shipping      = order_req.shipping_details.dict() if order_req.shipping_details else {}
-        amount_paise  = int(order_req.total_amount * 100)
+        shipping     = order_req.shipping_details.dict() if order_req.shipping_details else {}
+        amount_paise = int(order_req.total_amount * 100)
 
-        # Create Razorpay order
         rz_client, _, _ = get_razorpay_client()
         if rz_client:
             try:
@@ -452,19 +468,11 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
                     "currency": "INR",
                     "notes":    {"user_id": order_req.user_id, "email": shipping.get("email", "")}
                 })
-                print(f"✅ Razorpay order created: {razorpay_order['id']}")
             except Exception as rz_err:
-                print(f"❌ Razorpay order creation failed: {rz_err}")
                 raise HTTPException(status_code=500, detail=f"Payment gateway error: {rz_err}")
         else:
-            # Dev fallback when keys not set
-            razorpay_order = {
-                "id":       f"order_dev_{int(datetime.utcnow().timestamp())}",
-                "amount":   amount_paise,
-                "currency": "INR"
-            }
+            razorpay_order = {"id": f"order_dev_{int(datetime.utcnow().timestamp())}", "amount": amount_paise, "currency": "INR"}
 
-        # Save to pending_payments — NOT to orders
         db.pending_payments.insert_one({
             "razorpay_order_id": razorpay_order["id"],
             "user_id":           order_req.user_id,
@@ -474,12 +482,7 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
             "created_at":        datetime.utcnow(),
         })
 
-        return {
-            "success":        True,
-            "razorpay_order": razorpay_order,
-            # Return razorpay order id so frontend can pass it to verify-payment
-            "order":          {"id": razorpay_order["id"]}
-        }
+        return {"success": True, "razorpay_order": razorpay_order, "order": {"id": razorpay_order["id"]}}
 
     except HTTPException:
         raise
@@ -487,19 +490,13 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── STEP 2: Payment success → verify signature → save real order ──
 @app.post("/api/orders/verify-payment")
 def verify_payment(payment_data: dict):
-    """
-    ✅ Only called when Razorpay payment succeeds.
-    Verifies Razorpay signature, then creates the real order in DB.
-    """
     try:
         razorpay_order_id   = payment_data.get("razorpay_order_id")
         razorpay_payment_id = payment_data.get("razorpay_payment_id")
         razorpay_signature  = payment_data.get("razorpay_signature")
 
-        # Verify Razorpay signature — confirms payment is genuine
         _, _, rz_secret = get_razorpay_client()
         if rz_secret and razorpay_signature:
             msg      = f"{razorpay_order_id}|{razorpay_payment_id}"
@@ -509,37 +506,38 @@ def verify_payment(payment_data: dict):
                 hashlib.sha256
             ).hexdigest()
             if not hmac.compare_digest(expected, razorpay_signature):
-                raise HTTPException(status_code=400, detail="Payment signature verification failed — possible fraud")
+                raise HTTPException(status_code=400, detail="Payment signature verification failed")
 
-        # Fetch the pending payment data
         pending = db.pending_payments.find_one({"razorpay_order_id": razorpay_order_id})
         if not pending:
             raise HTTPException(status_code=404, detail="Pending payment record not found")
 
-        # ✅ NOW create the real confirmed order in DB
         now = datetime.utcnow()
         order_doc = {
-            "user_id":             pending["user_id"],
-            "items":               pending["items"],
-            "total_amount":        pending["total_amount"],
-            "shipping_details":    pending["shipping"],
-            "order_status":        "confirmed",
-            "payment_status":      "paid",
-            "createdAt":           now,
-            "created_at":          now.isoformat(),   # ✅ fixes Invalid Date
-            "paidAt":              now,
-            "razorpay_order_id":   razorpay_order_id,
-            "razorpay_payment_id": razorpay_payment_id,
-            "user_email":          pending["shipping"].get("email", ""),
-            "user_phone":          pending["shipping"].get("phone", ""),
-            "has_customisation":   any(i.get("customisation") for i in pending["items"]),
+            "user_id":                pending["user_id"],
+            "items":                  pending["items"],
+            "total_amount":           pending["total_amount"],
+            "shipping_details":       pending["shipping"],
+            "order_status":           "confirmed",
+            "payment_status":         "paid",
+            "createdAt":              now,
+            "created_at":             now.isoformat(),
+            "paidAt":                 now,
+            "razorpay_order_id":      razorpay_order_id,
+            "razorpay_payment_id":    razorpay_payment_id,
+            "user_email":             pending["shipping"].get("email", ""),
+            "user_phone":             pending["shipping"].get("phone", ""),
+            "has_customisation":      any(i.get("customisation") for i in pending["items"]),
+            # Shiprocket fields — filled when admin clicks Book Courier
+            "shiprocket_order_id":    None,
+            "shiprocket_shipment_id": None,
+            "shiprocket_awb":         None,
+            "shiprocket_courier":     None,
+            "tracking_url":           None,
         }
         result   = db.orders.insert_one(order_doc)
         order_id = str(result.inserted_id)
-
-        # Clean up pending payment record
         db.pending_payments.delete_one({"razorpay_order_id": razorpay_order_id})
-
         print(f"✅ Order confirmed: {order_id} | Payment: {razorpay_payment_id}")
         return {"success": True, "message": "Payment verified!", "order_id": order_id}
 
@@ -549,10 +547,8 @@ def verify_payment(payment_data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Called when user cancels/closes Razorpay modal ──
 @app.post("/api/orders/cancel-pending")
 def cancel_pending(data: dict):
-    """Cleans up pending payment when user cancels — no junk in DB"""
     try:
         razorpay_order_id = data.get("razorpay_order_id")
         if razorpay_order_id:
@@ -567,14 +563,169 @@ def get_user_orders(user_id: str, authorization: str = Header(None)):
     try:
         if not authorization:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        # ✅ Only return paid confirmed orders to customer
-        orders = list(db.orders.find({
-            "user_id":        user_id,
-            "payment_status": "paid"
-        }).sort("createdAt", -1))
+        orders = list(db.orders.find({"user_id": user_id, "payment_status": "paid"}).sort("createdAt", -1))
         for o in orders:
             fix_order_out(o)
         return orders
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============= SHIPROCKET =============
+
+@app.post("/api/admin/orders/{order_id}/book-courier")
+async def book_courier(order_id: str, admin_token: str = Header(None)):
+    """Admin clicks 'Book Courier' → creates shipment on Shiprocket → saves AWB to order"""
+    try:
+        if not admin_token:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        order = db.orders.find_one({"_id": ObjectId(order_id)})
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # Don't re-book if already done
+        if order.get("shiprocket_awb"):
+            return {
+                "success":      True,
+                "message":      "Shipment already booked",
+                "awb":          order["shiprocket_awb"],
+                "courier":      order.get("shiprocket_courier"),
+                "tracking_url": order.get("tracking_url")
+            }
+
+        ship     = order.get("shipping_details", {})
+        items    = order.get("items", [])
+        order_no = str(order["_id"])[-8:].upper()
+
+        token = await get_shiprocket_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        # Build items for Shiprocket
+        sr_items = []
+        for item in items:
+            sr_items.append({
+                "name":          item.get("product_name", "Handmade Product"),
+                "sku":           str(item.get("product_id", "SKU001"))[:20],
+                "units":         item.get("quantity", 1),
+                "selling_price": str(item.get("price", 0)),
+                "discount":      "",
+                "tax":           "",
+                "hsn":           ""
+            })
+
+        sr_payload = {
+            "order_id":              f"BC-{order_no}",
+            "order_date":            datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+            "pickup_location":       "Primary",
+            "billing_customer_name": ship.get("fullName", "Customer"),
+            "billing_last_name":     "",
+            "billing_address":       ship.get("address", ""),
+            "billing_address_2":     "",
+            "billing_city":          ship.get("city", ""),
+            "billing_pincode":       ship.get("postalCode", ""),
+            "billing_state":         ship.get("state", ""),
+            "billing_country":       "India",
+            "billing_email":         ship.get("email", ""),
+            "billing_phone":         ship.get("phone", ""),
+            "shipping_is_billing":   True,
+            "order_items":           sr_items,
+            "payment_method":        "Prepaid",
+            "shipping_charges":      0,
+            "giftwrap_charges":      0,
+            "transaction_charges":   0,
+            "total_discount":        0,
+            "sub_total":             order.get("total_amount", 0),
+            "length":                15,
+            "breadth":               12,
+            "height":                8,
+            "weight":                0.3
+        }
+
+        async with httpx.AsyncClient() as c:
+            create_resp = await c.post(
+                f"{SHIPROCKET_API}/orders/create/adhoc",
+                json=sr_payload, headers=headers, timeout=20
+            )
+
+        if create_resp.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=f"Shiprocket order failed: {create_resp.text}")
+
+        sr_data        = create_resp.json()
+        sr_order_id    = sr_data.get("order_id")
+        sr_shipment_id = sr_data.get("shipment_id")
+
+        # Auto-assign cheapest courier & get AWB
+        awb_code = courier_name = tracking_url = None
+        if sr_shipment_id:
+            async with httpx.AsyncClient() as c:
+                awb_resp = await c.post(
+                    f"{SHIPROCKET_API}/courier/assign/awb",
+                    json={"shipment_id": str(sr_shipment_id)},
+                    headers=headers, timeout=20
+                )
+            if awb_resp.status_code == 200:
+                awb_data     = awb_resp.json()
+                awb_code     = awb_data.get("response", {}).get("data", {}).get("awb_code")
+                courier_name = awb_data.get("response", {}).get("data", {}).get("courier_name")
+                if awb_code:
+                    tracking_url = f"https://shiprocket.co/tracking/{awb_code}"
+
+        # Save to DB
+        db.orders.update_one(
+            {"_id": ObjectId(order_id)},
+            {"$set": {
+                "order_status":           "processing",
+                "shiprocket_order_id":    sr_order_id,
+                "shiprocket_shipment_id": sr_shipment_id,
+                "shiprocket_awb":         awb_code,
+                "shiprocket_courier":     courier_name,
+                "tracking_url":           tracking_url,
+                "updatedAt":              datetime.utcnow()
+            }}
+        )
+
+        return {
+            "success":      True,
+            "message":      f"Shipment booked via {courier_name or 'courier'}!",
+            "awb":          awb_code,
+            "courier":      courier_name,
+            "tracking_url": tracking_url,
+            "sr_order_id":  sr_order_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Book courier error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/orders/{order_id}/tracking")
+async def get_tracking(order_id: str, admin_token: str = Header(None)):
+    try:
+        if not admin_token:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        order = db.orders.find_one({"_id": ObjectId(order_id)})
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        awb = order.get("shiprocket_awb")
+        if not awb:
+            return {"success": False, "message": "No shipment booked yet"}
+        token = await get_shiprocket_token()
+        async with httpx.AsyncClient() as c:
+            resp = await c.get(
+                f"{SHIPROCKET_API}/courier/track/awb/{awb}",
+                headers={"Authorization": f"Bearer {token}"}, timeout=15
+            )
+        return {
+            "success":       True,
+            "awb":           awb,
+            "courier":       order.get("shiprocket_courier"),
+            "tracking_url":  order.get("tracking_url"),
+            "tracking_data": resp.json() if resp.status_code == 200 else {}
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -587,7 +738,6 @@ def get_all_orders(admin_token: str = Header(None)):
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        # ✅ Admin only sees paid/confirmed orders — no pending/failed clutter
         orders = list(db.orders.find({"payment_status": "paid"}).sort("createdAt", -1))
         for o in orders:
             fix_order_out(o)
@@ -623,10 +773,9 @@ def get_dashboard_stats(admin_token: str = Header(None)):
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
         total_products  = db.products.count_documents({})
-        # ✅ Only count real paid orders
         total_orders    = db.orders.count_documents({"payment_status": "paid"})
         total_customers = db.users.count_documents({})
-        revenue_data = list(db.orders.aggregate([
+        revenue_data    = list(db.orders.aggregate([
             {"$match": {"payment_status": "paid"}},
             {"$group": {"_id": None, "total": {"$sum": "$total_amount"}}}
         ]))
