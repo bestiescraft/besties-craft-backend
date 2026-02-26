@@ -201,6 +201,10 @@ class Product(BaseModel):
     reviews_count: int = 0
     brand: Optional[str] = None
     warranty: Optional[str] = None
+    # ── BUG FIX: weight_grams was missing from the model entirely.
+    #    FastAPI was silently stripping it from every POST/PUT request,
+    #    so edits always lost the saved weight value in MongoDB. ──
+    weight_grams: Optional[int] = 500
 
     @validator("categories", pre=True, always=True)
     def normalise_cats(cls, v, values):
