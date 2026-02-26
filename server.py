@@ -51,6 +51,11 @@ SHIPROCKET_EMAIL    = os.getenv("SHIPROCKET_EMAIL", "")
 SHIPROCKET_PASSWORD = os.getenv("SHIPROCKET_PASSWORD", "")
 SHIPROCKET_API      = "https://apiv2.shiprocket.in/v1/external"
 
+# Pickup pincode — your Varanasi warehouse
+PICKUP_PINCODE = "221007"
+# Default parcel weight in kg
+DEFAULT_WEIGHT = 0.5
+
 # Cache token in memory (valid 24hrs)
 _sr_token_cache = {"token": None, "fetched_at": None}
 
@@ -61,7 +66,7 @@ async def get_shiprocket_token() -> str:
         if now - _sr_token_cache["fetched_at"] < 23 * 3600:
             return _sr_token_cache["token"]
     if not SHIPROCKET_EMAIL or not SHIPROCKET_PASSWORD:
-        raise HTTPException(status_code=500, detail="Shiprocket credentials not configured. Add SHIPROCKET_EMAIL and SHIPROCKET_PASSWORD to Render environment variables.")
+        raise HTTPException(status_code=500, detail="Shiprocket credentials not configured.")
     async with httpx.AsyncClient() as c:
         resp = await c.post(f"{SHIPROCKET_API}/auth/login", json={
             "email":    SHIPROCKET_EMAIL,
@@ -437,6 +442,116 @@ def admin_login(credentials: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============= SHIPPING RATES (LIVE SHIPROCKET) =============
+
+class CartItem(BaseModel):
+    product_id: str
+    quantity:   int = 1
+
+class ShippingRateRequest(BaseModel):
+    delivery_pincode: str
+    cart_items:       Optional[List[CartItem]] = None   # if provided, real weight is calculated
+    weight:           Optional[float]          = None   # manual override in kg (fallback)
+
+
+@app.post("/api/shipping-rates")
+async def get_shipping_rates(req: ShippingRateRequest):
+    """
+    Returns the cheapest available Shiprocket courier rate for a given delivery pincode.
+    Weight is calculated from cart_items by looking up each product's weight_grams in DB.
+    Falls back to DEFAULT_WEIGHT (0.5 kg) if products not found or no cart provided.
+    """
+    try:
+        delivery_pincode = req.delivery_pincode.strip()
+
+        # Validate pincode
+        if not delivery_pincode or not delivery_pincode.isdigit() or len(delivery_pincode) != 6:
+            raise HTTPException(status_code=400, detail="Invalid pincode — must be 6 digits")
+
+        # ── Calculate real weight from cart items ──
+        weight_kg = DEFAULT_WEIGHT  # fallback
+        if req.cart_items:
+            total_grams = 0
+            for item in req.cart_items:
+                try:
+                    product = db.products.find_one({"_id": ObjectId(item.product_id)})
+                    if product:
+                        grams = int(product.get("weight_grams", 500))
+                        total_grams += grams * item.quantity
+                    else:
+                        total_grams += 500 * item.quantity  # fallback per item
+                except Exception:
+                    total_grams += 500 * item.quantity
+            weight_kg = max(round(total_grams / 1000, 2), 0.1)  # min 100g
+        elif req.weight:
+            weight_kg = req.weight
+
+        token = await get_shiprocket_token()
+
+        params = {
+            "pickup_postcode":   PICKUP_PINCODE,
+            "delivery_postcode": delivery_pincode,
+            "weight":            weight_kg,
+            "cod":               0,           # prepaid only
+        }
+
+        async with httpx.AsyncClient() as c:
+            resp = await c.get(
+                f"{SHIPROCKET_API}/courier/serviceability/",
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+
+        if resp.status_code != 200:
+            return {
+                "success":       False,
+                "shipping_cost": 60,
+                "weight_kg":     weight_kg,
+                "courier":       None,
+                "message":       "Could not fetch live rates. Flat ₹60 applied.",
+            }
+
+        data     = resp.json()
+        couriers = data.get("data", {}).get("available_courier_companies", [])
+
+        if not couriers:
+            return {
+                "success":       False,
+                "shipping_cost": 60,
+                "weight_kg":     weight_kg,
+                "courier":       None,
+                "message":       "No courier available for this pincode. Flat ₹60 applied.",
+            }
+
+        # Pick cheapest available courier
+        cheapest = min(couriers, key=lambda x: float(x.get("rate", 9999)))
+
+        shipping_cost = float(cheapest.get("rate", 60))
+        courier_name  = cheapest.get("courier_name", "")
+        etd           = cheapest.get("etd", "")
+
+        return {
+            "success":       True,
+            "shipping_cost": round(shipping_cost, 2),
+            "weight_kg":     weight_kg,
+            "courier":       courier_name,
+            "etd":           etd,
+            "message":       f"Shipping via {courier_name} ({weight_kg}kg)",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Shipping rate error: {e}")
+        return {
+            "success":       False,
+            "shipping_cost": 60,
+            "weight_kg":     DEFAULT_WEIGHT,
+            "courier":       None,
+            "message":       "Could not fetch live rates. Flat ₹60 applied.",
+        }
+
 # ============= ORDERS =============
 
 @app.post("/api/orders/create")
@@ -528,7 +643,6 @@ def verify_payment(payment_data: dict):
             "user_email":             pending["shipping"].get("email", ""),
             "user_phone":             pending["shipping"].get("phone", ""),
             "has_customisation":      any(i.get("customisation") for i in pending["items"]),
-            # Shiprocket fields — filled when admin clicks Book Courier
             "shiprocket_order_id":    None,
             "shiprocket_shipment_id": None,
             "shiprocket_awb":         None,
@@ -572,7 +686,7 @@ def get_user_orders(user_id: str, authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============= SHIPROCKET =============
+# ============= SHIPROCKET BOOK COURIER =============
 
 @app.post("/api/admin/orders/{order_id}/book-courier")
 async def book_courier(order_id: str, admin_token: str = Header(None)):
@@ -585,7 +699,6 @@ async def book_courier(order_id: str, admin_token: str = Header(None)):
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        # Don't re-book if already done
         if order.get("shiprocket_awb"):
             return {
                 "success":      True,
@@ -602,7 +715,6 @@ async def book_courier(order_id: str, admin_token: str = Header(None)):
         token = await get_shiprocket_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        # Build items for Shiprocket
         sr_items = []
         for item in items:
             sr_items.append({
@@ -640,7 +752,7 @@ async def book_courier(order_id: str, admin_token: str = Header(None)):
             "length":                15,
             "breadth":               12,
             "height":                8,
-            "weight":                0.3
+            "weight":                DEFAULT_WEIGHT,
         }
 
         async with httpx.AsyncClient() as c:
@@ -656,7 +768,6 @@ async def book_courier(order_id: str, admin_token: str = Header(None)):
         sr_order_id    = sr_data.get("order_id")
         sr_shipment_id = sr_data.get("shipment_id")
 
-        # Auto-assign cheapest courier & get AWB
         awb_code = courier_name = tracking_url = None
         if sr_shipment_id:
             async with httpx.AsyncClient() as c:
@@ -672,7 +783,6 @@ async def book_courier(order_id: str, admin_token: str = Header(None)):
                 if awb_code:
                     tracking_url = f"https://shiprocket.co/tracking/{awb_code}"
 
-        # Save to DB
         db.orders.update_one(
             {"_id": ObjectId(order_id)},
             {"$set": {
