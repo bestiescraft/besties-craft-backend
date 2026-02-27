@@ -327,6 +327,34 @@ def sitemap_xml():
     return Response(content=xml, media_type="application/xml")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEBUG: Test Shiprocket login — open in browser to diagnose
+# Visit: https://besties-craft-backend-1.onrender.com/api/debug/shiprocket
+# DELETE this endpoint once shipping rates are working!
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.get("/api/debug/shiprocket")
+async def debug_shiprocket():
+    email    = os.getenv("SHIPROCKET_EMAIL", "NOT SET")
+    password = os.getenv("SHIPROCKET_PASSWORD", "NOT SET")
+    masked   = password[:3] + "***" + password[-2:] if len(password) > 5 else "TOO SHORT"
+    try:
+        async with httpx.AsyncClient() as c:
+            resp = await c.post(
+                "https://apiv2.shiprocket.in/v1/external/auth/login",
+                json={"email": email, "password": password},
+                timeout=15
+            )
+        return {
+            "email":           email,
+            "password_masked": masked,
+            "status_code":     resp.status_code,
+            "response":        resp.json() if resp.status_code in (200, 401, 403) else resp.text[:300],
+            "success":         resp.status_code == 200
+        }
+    except Exception as e:
+        return {"email": email, "password_masked": masked, "error": str(e)}
+
+
 # ============= MIGRATION =============
 
 @app.post("/api/admin/migrate-categories")
