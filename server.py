@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, validator
 from typing import List, Optional, Union
 from pymongo import MongoClient
@@ -37,9 +38,19 @@ if _FIREBASE_PROJECT_ID and not firebase_admin._apps:
 
 app = FastAPI(title="Besties Craft API", version="2.0")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUCTION FIX: CORS should only allow your actual domain in production.
+# For now allowing all origins so Vercel preview URLs also work.
+# Once domain is live, change allow_origins to ["https://www.bestiescraft.in"]
+# ─────────────────────────────────────────────────────────────────────────────
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://www.bestiescraft.in,https://bestiescraft.in,https://besties-craft-frontend.vercel.app"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],       # keep * until domain is fully live
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,19 +62,16 @@ SHIPROCKET_EMAIL    = os.getenv("SHIPROCKET_EMAIL", "")
 SHIPROCKET_PASSWORD = os.getenv("SHIPROCKET_PASSWORD", "")
 SHIPROCKET_API      = "https://apiv2.shiprocket.in/v1/external"
 
-# Pickup pincode — your Varanasi warehouse
-PICKUP_PINCODE = "221007"
-# Default parcel weight in kg
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX: PICKUP_PINCODE now reads from Render env var first.
+# Set PICKUP_PINCODE=221007 in Render → Environment if not already set.
+# ─────────────────────────────────────────────────────────────────────────────
+PICKUP_PINCODE = os.getenv("PICKUP_PINCODE", "221007")
 DEFAULT_WEIGHT = 0.5
 
-# Cache token in memory (valid 24hrs)
 _sr_token_cache = {"token": None, "fetched_at": None}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG FIX 1: Added cache invalidation on failed login so stale tokens are never
-#            reused on subsequent requests after credentials change or expire.
-# ─────────────────────────────────────────────────────────────────────────────
 async def get_shiprocket_token() -> str:
     import time
     now = time.time()
@@ -74,7 +82,7 @@ async def get_shiprocket_token() -> str:
     if not SHIPROCKET_EMAIL or not SHIPROCKET_PASSWORD:
         raise HTTPException(
             status_code=500,
-            detail="Shiprocket credentials not configured. Set SHIPROCKET_EMAIL and SHIPROCKET_PASSWORD in Render environment variables."
+            detail="Shiprocket credentials not configured. Add SHIPROCKET_EMAIL and SHIPROCKET_PASSWORD in Render → Environment."
         )
 
     try:
@@ -85,26 +93,27 @@ async def get_shiprocket_token() -> str:
                 timeout=15
             )
     except httpx.TimeoutException:
-        # BUG FIX: Clear cache on timeout so next request retries fresh
         _sr_token_cache["token"] = None
         _sr_token_cache["fetched_at"] = None
-        raise HTTPException(status_code=500, detail="Shiprocket login timed out.")
+        raise HTTPException(status_code=500, detail="Shiprocket login timed out. Please try again.")
     except Exception as e:
         _sr_token_cache["token"] = None
         _sr_token_cache["fetched_at"] = None
-        raise HTTPException(status_code=500, detail=f"Shiprocket login network error: {e}")
+        raise HTTPException(status_code=500, detail=f"Shiprocket network error: {e}")
 
     if resp.status_code != 200:
-        # BUG FIX: Always clear cache on any login failure
         _sr_token_cache["token"] = None
         _sr_token_cache["fetched_at"] = None
-        raise HTTPException(status_code=500, detail=f"Shiprocket login failed: {resp.text}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Shiprocket login failed (HTTP {resp.status_code}). Check credentials in Render env vars."
+        )
 
     token = resp.json().get("token")
     if not token:
         _sr_token_cache["token"] = None
         _sr_token_cache["fetched_at"] = None
-        raise HTTPException(status_code=500, detail="Shiprocket login returned no token.")
+        raise HTTPException(status_code=500, detail="Shiprocket returned no token.")
 
     _sr_token_cache["token"]      = token
     _sr_token_cache["fetched_at"] = now
@@ -201,9 +210,6 @@ class Product(BaseModel):
     reviews_count: int = 0
     brand: Optional[str] = None
     warranty: Optional[str] = None
-    # ── BUG FIX: weight_grams was missing from the model entirely.
-    #    FastAPI was silently stripping it from every POST/PUT request,
-    #    so edits always lost the saved weight value in MongoDB. ──
     weight_grams: Optional[int] = 500
 
     @validator("categories", pre=True, always=True)
@@ -253,6 +259,72 @@ def health_check():
         return {"status": "ok", "database": "connected", "products_count": db.products.count_documents({})}
     except Exception:
         return {"status": "error", "database": "disconnected", "products_count": 0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SEO: robots.txt — tells Google how to crawl your site
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt():
+    return """User-agent: *
+Allow: /
+
+Sitemap: https://www.bestiescraft.in/sitemap.xml
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SEO: sitemap.xml — tells Google every URL on your site
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.get("/sitemap.xml")
+def sitemap_xml():
+    base = "https://www.bestiescraft.in"
+    now  = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Static pages
+    static_urls = [
+        ("", "1.0", "daily"),
+        ("/products", "0.9", "daily"),
+        ("/about", "0.7", "monthly"),
+        ("/contact", "0.7", "monthly"),
+        ("/track-order", "0.5", "monthly"),
+    ]
+
+    urls_xml = ""
+    for path, priority, changefreq in static_urls:
+        urls_xml += f"""  <url>
+    <loc>{base}{path}</loc>
+    <lastmod>{now}</lastmod>
+    <changefreq>{changefreq}</changefreq>
+    <priority>{priority}</priority>
+  </url>
+"""
+
+    # Dynamic product pages
+    try:
+        products = list(db.products.find({}, {"_id": 1, "updatedAt": 1}))
+        for p in products:
+            pid      = str(p["_id"])
+            last_mod = p.get("updatedAt", datetime.utcnow())
+            if isinstance(last_mod, datetime):
+                last_mod = last_mod.strftime("%Y-%m-%d")
+            else:
+                last_mod = now
+            urls_xml += f"""  <url>
+    <loc>{base}/products/{pid}</loc>
+    <lastmod>{last_mod}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+"""
+    except Exception:
+        pass
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+{urls_xml}</urlset>"""
+
+    return Response(content=xml, media_type="application/xml")
 
 
 # ============= MIGRATION =============
@@ -501,7 +573,13 @@ def admin_login(credentials: dict):
         password = credentials.get("password")
         if not password:
             raise HTTPException(status_code=400, detail="Password required")
-        admin_password = os.getenv("ADMIN_PASSWORD", "Bhola143")
+        # ─────────────────────────────────────────────────────────────────────
+        # SECURITY FIX: Admin password MUST be set via Render environment var.
+        # No hardcoded fallback in production. Set ADMIN_PASSWORD in Render.
+        # ─────────────────────────────────────────────────────────────────────
+        admin_password = os.getenv("ADMIN_PASSWORD")
+        if not admin_password:
+            raise HTTPException(status_code=500, detail="Admin password not configured on server.")
         if password == admin_password:
             admin_email = os.getenv("ADMIN_EMAIL", "bestiescraft1434@gmail.com")
             token = hashlib.sha256(f"{admin_email}{datetime.utcnow()}".encode()).hexdigest()
@@ -526,17 +604,11 @@ class ShippingRateRequest(BaseModel):
     weight:           Optional[float]          = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG FIX 2: Shiprocket token 401/403 mid-session handling — if a cached token
-#            is rejected by Shiprocket during serviceability check, we now clear
-#            the cache and retry login once automatically instead of failing.
-# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/api/shipping-rates")
 async def get_shipping_rates(req: ShippingRateRequest):
     """
-    Returns the cheapest available Shiprocket courier rate for a given delivery pincode.
-    Weight is calculated from cart_items by looking up each product's weight_grams in DB.
-    Falls back to DEFAULT_WEIGHT (0.5 kg) if products not found or no cart provided.
+    Returns cheapest Shiprocket courier rate for a given delivery pincode.
+    Falls back to flat ₹60 if Shiprocket is unavailable (never shows error to customer).
     """
     try:
         delivery_pincode = req.delivery_pincode.strip()
@@ -551,11 +623,8 @@ async def get_shipping_rates(req: ShippingRateRequest):
             for item in req.cart_items:
                 try:
                     product = db.products.find_one({"_id": ObjectId(item.product_id)})
-                    if product:
-                        grams = int(product.get("weight_grams", 500))
-                        total_grams += grams * item.quantity
-                    else:
-                        total_grams += 500 * item.quantity
+                    grams   = int(product.get("weight_grams", 500)) if product else 500
+                    total_grams += grams * item.quantity
                 except Exception:
                     total_grams += 500 * item.quantity
             weight_kg = max(round(total_grams / 1000, 2), 0.1)
@@ -579,7 +648,7 @@ async def get_shipping_rates(req: ShippingRateRequest):
                 timeout=15,
             )
 
-        # BUG FIX: If token expired mid-session (401), retry once with fresh token
+        # Auto-retry once if token expired mid-session
         if resp.status_code == 401:
             _sr_token_cache["token"] = None
             _sr_token_cache["fetched_at"] = None
@@ -594,11 +663,9 @@ async def get_shipping_rates(req: ShippingRateRequest):
 
         if resp.status_code != 200:
             return {
-                "success":       False,
-                "shipping_cost": 60,
-                "weight_kg":     weight_kg,
-                "courier":       None,
-                "message":       "Could not fetch live rates. Flat ₹60 applied.",
+                "success": False, "shipping_cost": 60,
+                "weight_kg": weight_kg, "courier": None,
+                "message": "Could not fetch live rates. Flat ₹60 applied.",
             }
 
         data     = resp.json()
@@ -606,26 +673,23 @@ async def get_shipping_rates(req: ShippingRateRequest):
 
         if not couriers:
             return {
-                "success":       False,
-                "shipping_cost": 60,
-                "weight_kg":     weight_kg,
-                "courier":       None,
-                "message":       "No courier available for this pincode. Flat ₹60 applied.",
+                "success": False, "shipping_cost": 60,
+                "weight_kg": weight_kg, "courier": None,
+                "message": "No courier available for this pincode. Flat ₹60 applied.",
             }
 
-        cheapest = min(couriers, key=lambda x: float(x.get("rate", 9999)))
-
+        cheapest      = min(couriers, key=lambda x: float(x.get("rate", 9999)))
         shipping_cost = float(cheapest.get("rate", 60))
         courier_name  = cheapest.get("courier_name", "")
         etd           = cheapest.get("etd", "")
 
         return {
-            "success":       True,
+            "success": True,
             "shipping_cost": round(shipping_cost, 2),
-            "weight_kg":     weight_kg,
-            "courier":       courier_name,
-            "etd":           etd,
-            "message":       f"Shipping via {courier_name} ({weight_kg}kg)",
+            "weight_kg": weight_kg,
+            "courier": courier_name,
+            "etd": etd,
+            "message": f"Shipping via {courier_name} ({weight_kg}kg)",
         }
 
     except HTTPException:
@@ -633,11 +697,9 @@ async def get_shipping_rates(req: ShippingRateRequest):
     except Exception as e:
         print(f"Shipping rate error: {e}")
         return {
-            "success":       False,
-            "shipping_cost": 60,
-            "weight_kg":     DEFAULT_WEIGHT,
-            "courier":       None,
-            "message":       "Could not fetch live rates. Flat ₹60 applied.",
+            "success": False, "shipping_cost": 60,
+            "weight_kg": DEFAULT_WEIGHT, "courier": None,
+            "message": "Could not fetch live rates. Flat ₹60 applied.",
         }
 
 
@@ -698,16 +760,6 @@ def create_order_v2(order_req: CreateOrderRequest, authorization: str = Header(N
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG FIX 3: `hmac.new` does NOT exist in Python's hmac module.
-#            The correct function is `hmac.new` → NO, it is `hmac.new` is wrong.
-#            The correct call is `hmac.new(key, msg, digestmod)` which actually
-#            DOES exist as an alias BUT is deprecated. The safe, correct form is
-#            `hmac.new(key, msg, digestmod)` — however in your code you used
-#            `hmac.new(...)` which is fine in Python 3. The REAL bug was that
-#            `hmac.compare_digest` was called on the wrong variable name in some
-#            versions. Fixed below with explicit variable names and safe handling.
-# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/api/orders/verify-payment")
 def verify_payment(payment_data: dict):
     try:
@@ -721,16 +773,12 @@ def verify_payment(payment_data: dict):
         _, _, rz_secret = get_razorpay_client()
 
         if rz_secret and razorpay_signature:
-            msg_str  = f"{razorpay_order_id}|{razorpay_payment_id}"
-            # BUG FIX: Use hmac.new (correct Python API), not hmac.new which
-            # was written as `hmac.new` in original but is actually correct.
-            # Ensured digestmod is passed as hashlib.sha256 (the class, not instance).
-            expected_signature = hmac.new(
+            msg_str              = f"{razorpay_order_id}|{razorpay_payment_id}"
+            expected_signature   = hmac.new(
                 rz_secret.encode("utf-8"),
                 msg_str.encode("utf-8"),
                 hashlib.sha256
             ).hexdigest()
-            # BUG FIX: hmac.compare_digest requires both args to be same type (str/str)
             if not hmac.compare_digest(expected_signature, str(razorpay_signature)):
                 raise HTTPException(status_code=400, detail="Payment signature verification failed")
 
@@ -798,11 +846,101 @@ def get_user_orders(user_id: str, authorization: str = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW: PUBLIC ORDER TRACKING — customers can track by order ID
+# Used by OrderTrackingPage.js on the frontend
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.get("/api/orders/track/{order_id}")
+def track_order(order_id: str):
+    """
+    Public endpoint — no auth required.
+    Returns safe tracking info only (no payment IDs exposed).
+    Accepts both MongoDB _id and razorpay_order_id.
+    """
+    try:
+        order = None
+
+        # Try MongoDB ObjectId first
+        if len(order_id) == 24:
+            try:
+                order = db.orders.find_one({
+                    "_id": ObjectId(order_id),
+                    "payment_status": "paid"
+                })
+            except Exception:
+                pass
+
+        # Fallback: try razorpay_order_id
+        if not order:
+            order = db.orders.find_one({
+                "razorpay_order_id": order_id,
+                "payment_status": "paid"
+            })
+
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found. Please check your Order ID.")
+
+        # Safe fields only — never expose payment IDs to public
+        ship = order.get("shipping_details", {})
+
+        # Map internal status to customer-friendly display
+        status_map = {
+            "confirmed":  {"label": "Order Confirmed",  "step": 1},
+            "processing": {"label": "Being Prepared",   "step": 2},
+            "shipped":    {"label": "Shipped",          "step": 3},
+            "delivered":  {"label": "Delivered",        "step": 4},
+            "cancelled":  {"label": "Cancelled",        "step": 0},
+        }
+        raw_status   = order.get("order_status", "confirmed")
+        status_info  = status_map.get(raw_status, {"label": raw_status.title(), "step": 1})
+
+        created_at = order.get("createdAt") or order.get("created_at")
+        if isinstance(created_at, datetime):
+            created_at = created_at.isoformat()
+
+        return {
+            "success":      True,
+            "order_id":     str(order["_id"]),
+            "order_status": raw_status,
+            "status_label": status_info["label"],
+            "status_step":  status_info["step"],
+            "created_at":   created_at,
+            "total_amount": order.get("total_amount", 0),
+            "items":        [
+                {
+                    "product_name":  i.get("product_name", "Product"),
+                    "quantity":      i.get("quantity", 1),
+                    "price":         i.get("price", 0),
+                    "color":         i.get("color"),
+                    "customisation": i.get("customisation"),
+                }
+                for i in order.get("items", [])
+            ],
+            "shipping": {
+                "fullName":   ship.get("fullName"),
+                "city":       ship.get("city"),
+                "state":      ship.get("state"),
+                "postalCode": ship.get("postalCode"),
+                "phone":      ship.get("phone"),
+            },
+            "tracking": {
+                "awb":          order.get("shiprocket_awb"),
+                "courier":      order.get("shiprocket_courier"),
+                "tracking_url": order.get("tracking_url"),
+                "etd":          order.get("etd"),
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============= SHIPROCKET BOOK COURIER =============
 
 @app.post("/api/admin/orders/{order_id}/book-courier")
 async def book_courier(order_id: str, admin_token: str = Header(None)):
-    """Admin clicks 'Book Courier' → creates shipment on Shiprocket → saves AWB to order"""
     try:
         if not admin_token:
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -824,7 +962,7 @@ async def book_courier(order_id: str, admin_token: str = Header(None)):
         items    = order.get("items", [])
         order_no = str(order["_id"])[-8:].upper()
 
-        token = await get_shiprocket_token()
+        token   = await get_shiprocket_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
         sr_items = []
@@ -876,7 +1014,7 @@ async def book_courier(order_id: str, admin_token: str = Header(None)):
         if create_resp.status_code not in (200, 201):
             raise HTTPException(
                 status_code=500,
-                detail=f"Shiprocket order failed: {create_resp.text}"
+                detail=f"Shiprocket order creation failed: {create_resp.text}"
             )
 
         sr_data        = create_resp.json()
