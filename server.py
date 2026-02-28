@@ -38,11 +38,6 @@ if _FIREBASE_PROJECT_ID and not firebase_admin._apps:
 
 app = FastAPI(title="Besties Craft API", version="2.0")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRODUCTION FIX: CORS should only allow your actual domain in production.
-# For now allowing all origins so Vercel preview URLs also work.
-# Once domain is live, change allow_origins to ["https://www.bestiescraft.in"]
-# ─────────────────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "https://www.bestiescraft.in,https://bestiescraft.in,https://besties-craft-frontend.vercel.app"
@@ -50,7 +45,7 @@ ALLOWED_ORIGINS = os.getenv(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # keep * until domain is fully live
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,10 +57,6 @@ SHIPROCKET_EMAIL    = os.getenv("SHIPROCKET_EMAIL", "")
 SHIPROCKET_PASSWORD = os.getenv("SHIPROCKET_PASSWORD", "")
 SHIPROCKET_API      = "https://apiv2.shiprocket.in/v1/external"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX: PICKUP_PINCODE now reads from Render env var first.
-# Set PICKUP_PINCODE=221007 in Render → Environment if not already set.
-# ─────────────────────────────────────────────────────────────────────────────
 PICKUP_PINCODE = os.getenv("PICKUP_PINCODE", "221007")
 DEFAULT_WEIGHT = 0.5
 
@@ -261,9 +252,6 @@ def health_check():
         return {"status": "error", "database": "disconnected", "products_count": 0}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SEO: robots.txt — tells Google how to crawl your site
-# ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt():
     return """User-agent: *
@@ -273,15 +261,11 @@ Sitemap: https://www.bestiescraft.in/sitemap.xml
 """
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SEO: sitemap.xml — tells Google every URL on your site
-# ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/sitemap.xml")
 def sitemap_xml():
     base = "https://www.bestiescraft.in"
     now  = datetime.utcnow().strftime("%Y-%m-%d")
 
-    # Static pages
     static_urls = [
         ("", "1.0", "daily"),
         ("/products", "0.9", "daily"),
@@ -300,7 +284,6 @@ def sitemap_xml():
   </url>
 """
 
-    # Dynamic product pages
     try:
         products = list(db.products.find({}, {"_id": 1, "updatedAt": 1}))
         for p in products:
@@ -327,11 +310,6 @@ def sitemap_xml():
     return Response(content=xml, media_type="application/xml")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DEBUG: Test Shiprocket login — open in browser to diagnose
-# Visit: https://besties-craft-backend-1.onrender.com/api/debug/shiprocket
-# DELETE this endpoint once shipping rates are working!
-# ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/debug/shiprocket")
 async def debug_shiprocket():
     email    = os.getenv("SHIPROCKET_EMAIL", "NOT SET")
@@ -584,8 +562,17 @@ def verify_firebase_token(data: dict):
         except Exception as verify_err:
             print(f"Firebase token verification failed: {verify_err}")
             raise HTTPException(status_code=401, detail="Invalid or expired Firebase token")
-        user_data = {"firebase_uid": uid, "email": email, "lastLogin": datetime.utcnow()}
+
+        # ✅ FIX: Save name and phone so admin customers page shows real names
+        user_data = {
+            "firebase_uid": uid,
+            "email":        email,
+            "name":         decoded.get("name") or decoded.get("display_name") or email.split("@")[0],
+            "phone":        decoded.get("phone_number") or "",
+            "lastLogin":    datetime.utcnow()
+        }
         db.users.update_one({"firebase_uid": uid}, {"$set": user_data}, upsert=True)
+
         user    = db.users.find_one({"firebase_uid": uid})
         user_id = str(user["_id"]) if user else uid
         return {"success": True, "user": {"id": user_id, "email": email, "firebase_uid": uid}}
@@ -601,10 +588,6 @@ def admin_login(credentials: dict):
         password = credentials.get("password")
         if not password:
             raise HTTPException(status_code=400, detail="Password required")
-        # ─────────────────────────────────────────────────────────────────────
-        # SECURITY FIX: Admin password MUST be set via Render environment var.
-        # No hardcoded fallback in production. Set ADMIN_PASSWORD in Render.
-        # ─────────────────────────────────────────────────────────────────────
         admin_password = os.getenv("ADMIN_PASSWORD")
         if not admin_password:
             raise HTTPException(status_code=500, detail="Admin password not configured on server.")
@@ -619,7 +602,7 @@ def admin_login(credentials: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============= SHIPPING RATES (LIVE SHIPROCKET) =============
+# ============= SHIPPING RATES =============
 
 class CartItem(BaseModel):
     product_id: str
@@ -634,17 +617,12 @@ class ShippingRateRequest(BaseModel):
 
 @app.post("/api/shipping-rates")
 async def get_shipping_rates(req: ShippingRateRequest):
-    """
-    Returns cheapest Shiprocket courier rate for a given delivery pincode.
-    Falls back to flat ₹60 if Shiprocket is unavailable (never shows error to customer).
-    """
     try:
         delivery_pincode = req.delivery_pincode.strip()
 
         if not delivery_pincode or not delivery_pincode.isdigit() or len(delivery_pincode) != 6:
             raise HTTPException(status_code=400, detail="Invalid pincode — must be 6 digits")
 
-        # Calculate real weight from cart items
         weight_kg = DEFAULT_WEIGHT
         if req.cart_items:
             total_grams = 0
@@ -676,7 +654,6 @@ async def get_shipping_rates(req: ShippingRateRequest):
                 timeout=15,
             )
 
-        # Auto-retry once if token expired mid-session
         if resp.status_code == 401:
             _sr_token_cache["token"] = None
             _sr_token_cache["fetched_at"] = None
@@ -801,8 +778,8 @@ def verify_payment(payment_data: dict):
         _, _, rz_secret = get_razorpay_client()
 
         if rz_secret and razorpay_signature:
-            msg_str              = f"{razorpay_order_id}|{razorpay_payment_id}"
-            expected_signature   = hmac.new(
+            msg_str            = f"{razorpay_order_id}|{razorpay_payment_id}"
+            expected_signature = hmac.new(
                 rz_secret.encode("utf-8"),
                 msg_str.encode("utf-8"),
                 hashlib.sha256
@@ -874,21 +851,11 @@ def get_user_orders(user_id: str, authorization: str = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# NEW: PUBLIC ORDER TRACKING — customers can track by order ID
-# Used by OrderTrackingPage.js on the frontend
-# ═══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/orders/track/{order_id}")
 def track_order(order_id: str):
-    """
-    Public endpoint — no auth required.
-    Returns safe tracking info only (no payment IDs exposed).
-    Accepts both MongoDB _id and razorpay_order_id.
-    """
     try:
         order = None
 
-        # Try MongoDB ObjectId first
         if len(order_id) == 24:
             try:
                 order = db.orders.find_one({
@@ -898,7 +865,6 @@ def track_order(order_id: str):
             except Exception:
                 pass
 
-        # Fallback: try razorpay_order_id
         if not order:
             order = db.orders.find_one({
                 "razorpay_order_id": order_id,
@@ -908,10 +874,8 @@ def track_order(order_id: str):
         if not order:
             raise HTTPException(status_code=404, detail="Order not found. Please check your Order ID.")
 
-        # Safe fields only — never expose payment IDs to public
         ship = order.get("shipping_details", {})
 
-        # Map internal status to customer-friendly display
         status_map = {
             "confirmed":  {"label": "Order Confirmed",  "step": 1},
             "processing": {"label": "Being Prepared",   "step": 2},
@@ -919,8 +883,8 @@ def track_order(order_id: str):
             "delivered":  {"label": "Delivered",        "step": 4},
             "cancelled":  {"label": "Cancelled",        "step": 0},
         }
-        raw_status   = order.get("order_status", "confirmed")
-        status_info  = status_map.get(raw_status, {"label": raw_status.title(), "step": 1})
+        raw_status  = order.get("order_status", "confirmed")
+        status_info = status_map.get(raw_status, {"label": raw_status.title(), "step": 1})
 
         created_at = order.get("createdAt") or order.get("created_at")
         if isinstance(created_at, datetime):
